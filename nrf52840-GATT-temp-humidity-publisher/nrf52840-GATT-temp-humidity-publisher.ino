@@ -744,8 +744,9 @@ void setupGatt()
 void setup()
 {
   // Built-in LED OFF
+  Bluefruit.autoConnLed(false);
   pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
+  ledOff(LED_BUILTIN);
 
   Serial.begin(115200);
 
