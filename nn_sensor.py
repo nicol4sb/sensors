@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+# source ~/vmc-venv/bin/activate to load the appropriate env
+
 import asyncio
 import csv
 import struct
