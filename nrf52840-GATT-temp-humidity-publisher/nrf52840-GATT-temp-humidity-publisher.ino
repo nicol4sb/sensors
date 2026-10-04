@@ -1,62 +1,139 @@
-#include <bluefruit.h>
-#include <Adafruit_TinyUSB.h>
+#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_SHT4x.h>
+#include <bluefruit.h>
+#include <Adafruit_TinyUSB.h>
+#include <math.h>
 
 // ============================================================
-// CONFIGURATION
+// SENSOR IDENTITY
 // ============================================================
-
-#define SENSOR_ID                1
-#define SENSOR_NAME              "NNTempHumidity1"
-
-#define SAMPLE_INTERVAL_MS       60000UL      // 1 minute
-#define BATTERY_INTERVAL_MS      600000UL     // 10 minutes
-#define GATT_WINDOW_MS           10000UL       // 10 seconds
-
-#define HISTORY_CAPACITY         1440         // 24 h @ 1/min
-#define BATTERY_HISTORY_CAPACITY 144          // 24 h @ 1/10 min
-
-#define HISTORY_BLOCK_SAMPLES    20
-#define BATTERY_BLOCK_SAMPLES    20
-
-// nice!nano-style battery input.
-// Community Pro Micro board definition normally maps A3 -> P0.04.
-#define BATTERY_PIN 4
-
-// Battery divider calibration.
 //
-// Genuine nice!nano v1-style circuitry uses a divided battery signal.
-// Start with 2.0. Verify against a multimeter and adjust if necessary.
-#define BATTERY_DIVIDER_RATIO    2.0f
+// RED SENSOR:
+//   SENSOR_ID   1
+//   SENSOR_NAME "NNTempHumidityRed"
+//
+// GREEN SENSOR:
+//   SENSOR_ID   2
+//   SENSOR_NAME "NNTempHumidityGreen"
+//
+// CHANGE THESE TWO LINES WHEN FLASHING THE OTHER SENSOR.
+// ============================================================
+
+#define SENSOR_ID   2
+#define SENSOR_NAME "NNTempHumidityGreen"
+
 
 // ============================================================
-// UUIDs
+// TIMING
 // ============================================================
 
-#define SERVICE_UUID \
-  "7a100000-4c7f-4f4d-432d-564d4353454e"
+static const uint32_t ENV_INTERVAL_MS =
+    60UL * 1000UL;
 
-#define META_UUID \
-  "7a100001-4c7f-4f4d-432d-564d4353454e"
+static const uint32_t BATTERY_INTERVAL_MS =
+    10UL * 60UL * 1000UL;
 
-#define CURRENT_UUID \
-  "7a100002-4c7f-4f4d-432d-564d4353454e"
+static const uint32_t ADVERTISING_DURATION_SECONDS =
+    10;
 
-#define HISTORY_INDEX_UUID \
-  "7a100003-4c7f-4f4d-432d-564d4353454e"
 
-#define HISTORY_BLOCK_UUID \
-  "7a100004-4c7f-4f4d-432d-564d4353454e"
+// ============================================================
+// HISTORY CAPACITIES
+// ============================================================
 
-#define BATTERY_CURRENT_UUID \
-  "7a100005-4c7f-4f4d-432d-564d4353454e"
+// 24 hours of one-minute environmental measurements
 
-#define BATTERY_INDEX_UUID \
-  "7a100006-4c7f-4f4d-432d-564d4353454e"
+static const uint16_t ENV_HISTORY_CAPACITY =
+    24 * 60;
 
-#define BATTERY_BLOCK_UUID \
-  "7a100007-4c7f-4f4d-432d-564d4353454e"
+
+// 24 hours of one battery measurement every 10 minutes
+
+static const uint16_t BATTERY_HISTORY_CAPACITY =
+    24 * 6;
+
+
+// ============================================================
+// BLE STREAM PACKET SIZES
+// ============================================================
+//
+// ATT MTU target:
+//     247 bytes
+//
+// Maximum notification characteristic payload:
+//     247 - 3 = 244 bytes
+//
+// Environmental packet:
+//     4 byte header
+//     + 30 * 8 byte samples
+//     = 244 bytes
+//
+// Battery packet:
+//     4 byte header
+//     + 40 * 6 byte samples
+//     = 244 bytes
+//
+// ============================================================
+
+static const uint16_t ENV_SAMPLES_PER_BLOCK = 30;
+static const uint16_t BATTERY_SAMPLES_PER_BLOCK = 40;
+
+static const uint16_t ENV_BLOCK_MAX =
+    4 + ENV_SAMPLES_PER_BLOCK * 8;
+
+static const uint16_t BATTERY_BLOCK_MAX =
+    4 + BATTERY_SAMPLES_PER_BLOCK * 6;
+
+
+// ============================================================
+// DATA STRUCTURES
+// ============================================================
+
+struct __attribute__((packed)) EnvironmentSample
+{
+    uint32_t sequence;
+    int16_t temperature;
+    uint16_t humidity;
+};
+
+
+struct __attribute__((packed)) BatterySample
+{
+    uint32_t sequence;
+    uint16_t millivolts;
+};
+
+
+// Compile-time sanity checks
+
+static_assert(
+    sizeof(EnvironmentSample) == 8,
+    "EnvironmentSample must be 8 bytes"
+);
+
+static_assert(
+    sizeof(BatterySample) == 6,
+    "BatterySample must be 6 bytes"
+);
+
+
+// ============================================================
+// HISTORY BUFFERS
+// ============================================================
+
+EnvironmentSample envHistory[ENV_HISTORY_CAPACITY];
+
+BatterySample batteryHistory[BATTERY_HISTORY_CAPACITY];
+
+
+uint16_t envHead = 0;
+uint16_t envCount = 0;
+
+uint16_t batteryHead = 0;
+uint16_t batteryCount = 0;
+
+uint32_t sequenceNumber = 0;
 
 
 // ============================================================
@@ -67,518 +144,319 @@ Adafruit_SHT4x sht4;
 
 
 // ============================================================
-// SAMPLE STRUCTURES
+// BLE UUIDs
 // ============================================================
 
-struct __attribute__((packed)) VMCSample
+BLEService vmcService(
+    "7a100000-4c7f-4f4d-432d-564d4353454e"
+);
+
+BLECharacteristic metadataCharacteristic(
+    "7a100001-4c7f-4f4d-432d-564d4353454e"
+);
+
+BLECharacteristic currentCharacteristic(
+    "7a100002-4c7f-4f4d-432d-564d4353454e"
+);
+
+BLECharacteristic historyIndexCharacteristic(
+    "7a100003-4c7f-4f4d-432d-564d4353454e"
+);
+
+BLECharacteristic historyBlockCharacteristic(
+    "7a100004-4c7f-4f4d-432d-564d4353454e"
+);
+
+BLECharacteristic batteryCurrentCharacteristic(
+    "7a100005-4c7f-4f4d-432d-564d4353454e"
+);
+
+BLECharacteristic batteryIndexCharacteristic(
+    "7a100006-4c7f-4f4d-432d-564d4353454e"
+);
+
+BLECharacteristic batteryBlockCharacteristic(
+    "7a100007-4c7f-4f4d-432d-564d4353454e"
+);
+
+
+// ============================================================
+// STREAM STATE
+// ============================================================
+
+volatile bool envStreamRequested = false;
+volatile uint16_t envRequestedIndex = 0;
+
+volatile bool batteryStreamRequested = false;
+volatile uint16_t batteryRequestedIndex = 0;
+
+
+bool envStreaming = false;
+uint16_t envStreamIndex = 0;
+uint16_t envStreamCount = 0;
+uint16_t envStreamOldestPhysical = 0;
+
+
+bool batteryStreaming = false;
+uint16_t batteryStreamIndex = 0;
+uint16_t batteryStreamCount = 0;
+uint16_t batteryStreamOldestPhysical = 0;
+
+
+// ============================================================
+// TIMERS
+// ============================================================
+
+uint32_t lastEnvironmentMeasurement = 0;
+uint32_t lastBatteryMeasurement = 0;
+
+
+
+// ============================================================
+// LITTLE-ENDIAN HELPERS
+// ============================================================
+
+void put16(uint8_t *buffer, uint16_t value)
 {
-  uint32_t seq;
-  int16_t temperature_centi;
-  uint16_t humidity_centi;
-};
-
-static_assert(sizeof(VMCSample) == 8, "VMCSample must be 8 bytes");
-
-
-struct __attribute__((packed)) BatterySample
-{
-  uint32_t seq;
-  uint16_t millivolts;
-};
-
-static_assert(sizeof(BatterySample) == 6, "BatterySample must be 6 bytes");
-
-
-// ============================================================
-// ENVIRONMENT HISTORY
-// ============================================================
-
-VMCSample history[HISTORY_CAPACITY];
-
-uint16_t historyHead = 0;
-uint16_t historyCount = 0;
-
-uint32_t nextSequence = 1;
-
-VMCSample currentSample = {};
-
-bool haveSample = false;
-
-
-// ============================================================
-// BATTERY HISTORY
-// ============================================================
-
-BatterySample batteryHistory[BATTERY_HISTORY_CAPACITY];
-
-uint16_t batteryHead = 0;
-uint16_t batteryCount = 0;
-
-BatterySample currentBattery = {};
-
-bool haveBattery = false;
-
-
-// ============================================================
-// BLE
-// ============================================================
-
-BLEService vmcService(SERVICE_UUID);
-
-BLECharacteristic metaChar(META_UUID);
-BLECharacteristic currentChar(CURRENT_UUID);
-
-BLECharacteristic historyIndexChar(HISTORY_INDEX_UUID);
-BLECharacteristic historyBlockChar(HISTORY_BLOCK_UUID);
-
-BLECharacteristic batteryCurrentChar(BATTERY_CURRENT_UUID);
-BLECharacteristic batteryIndexChar(BATTERY_INDEX_UUID);
-BLECharacteristic batteryBlockChar(BATTERY_BLOCK_UUID);
-
-
-// ============================================================
-// STATE
-// ============================================================
-
-volatile bool clientConnected = false;
-
-bool gattWindowOpen = false;
-
-uint32_t gattWindowStarted = 0;
-uint32_t lastMeasurementTime = 0;
-uint32_t lastBatteryTime = 0;
-
-uint16_t requestedHistoryIndex = 0;
-uint16_t requestedBatteryIndex = 0;
-
-
-// ============================================================
-// LITTLE ENDIAN
-// ============================================================
-
-void putLE16(uint8_t *p, uint16_t v)
-{
-  p[0] = v & 0xFF;
-  p[1] = (v >> 8) & 0xFF;
+    buffer[0] = value & 0xFF;
+    buffer[1] = (value >> 8) & 0xFF;
 }
 
 
-void putLE32(uint8_t *p, uint32_t v)
+void put32(uint8_t *buffer, uint32_t value)
 {
-  p[0] = v & 0xFF;
-  p[1] = (v >> 8) & 0xFF;
-  p[2] = (v >> 16) & 0xFF;
-  p[3] = (v >> 24) & 0xFF;
+    buffer[0] = value & 0xFF;
+    buffer[1] = (value >> 8) & 0xFF;
+    buffer[2] = (value >> 16) & 0xFF;
+    buffer[3] = (value >> 24) & 0xFF;
 }
 
 
-uint16_t getLE16(const uint8_t *p)
+uint16_t get16(const uint8_t *buffer)
 {
-  return ((uint16_t)p[0]) |
-         ((uint16_t)p[1] << 8);
+    return
+        ((uint16_t)buffer[0]) |
+        ((uint16_t)buffer[1] << 8);
 }
 
 
 // ============================================================
-// ENVIRONMENT HISTORY
+// BATTERY
 // ============================================================
 
-void addHistory(const VMCSample &s)
+uint16_t readBatteryMillivolts()
 {
-  history[historyHead] = s;
+    analogReadResolution(12);
 
-  historyHead = (historyHead + 1) % HISTORY_CAPACITY;
+    uint32_t raw = analogReadVDDHDIV5();
 
-  if (historyCount < HISTORY_CAPACITY) {
-    historyCount++;
-  }
-}
+    float millivolts =
+        ((float)raw * 3600.0f * 5.0f) / 4095.0f;
 
+    if (millivolts > 6000.0f)
+    {
+        millivolts = 6000.0f;
+    }
 
-VMCSample getHistory(uint16_t index)
-{
-  uint16_t oldest =
-    (historyCount < HISTORY_CAPACITY)
-      ? 0
-      : historyHead;
-
-  uint16_t physical =
-    (oldest + index) % HISTORY_CAPACITY;
-
-  return history[physical];
+    return (uint16_t)roundf(millivolts);
 }
 
 
 // ============================================================
-// BATTERY HISTORY
+// CIRCULAR BUFFER HELPERS
 // ============================================================
 
-void addBatteryHistory(const BatterySample &s)
+uint16_t envOldestPhysicalIndex()
 {
-  batteryHistory[batteryHead] = s;
+    if (envCount < ENV_HISTORY_CAPACITY)
+    {
+        return 0;
+    }
 
-  batteryHead =
-    (batteryHead + 1) %
-    BATTERY_HISTORY_CAPACITY;
-
-  if (batteryCount < BATTERY_HISTORY_CAPACITY) {
-    batteryCount++;
-  }
+    return envHead;
 }
 
 
-BatterySample getBatteryHistory(uint16_t index)
+uint16_t batteryOldestPhysicalIndex()
 {
-  uint16_t oldest =
-    (batteryCount < BATTERY_HISTORY_CAPACITY)
-      ? 0
-      : batteryHead;
+    if (batteryCount < BATTERY_HISTORY_CAPACITY)
+    {
+        return 0;
+    }
 
-  uint16_t physical =
-    (oldest + index) %
-    BATTERY_HISTORY_CAPACITY;
+    return batteryHead;
+}
 
-  return batteryHistory[physical];
+
+// ============================================================
+// STORE ENVIRONMENT SAMPLE
+// ============================================================
+
+void storeEnvironmentSample(
+    int16_t temperature,
+    uint16_t humidity
+)
+{
+    sequenceNumber++;
+
+    EnvironmentSample sample;
+
+    sample.sequence = sequenceNumber;
+    sample.temperature = temperature;
+    sample.humidity = humidity;
+
+    envHistory[envHead] = sample;
+
+    envHead++;
+
+    if (envHead >= ENV_HISTORY_CAPACITY)
+    {
+        envHead = 0;
+    }
+
+    if (envCount < ENV_HISTORY_CAPACITY)
+    {
+        envCount++;
+    }
+
+    // Current characteristic
+
+    uint8_t currentData[8];
+
+    put32(
+        currentData,
+        sample.sequence
+    );
+
+    put16(
+        currentData + 4,
+        (uint16_t)sample.temperature
+    );
+
+    put16(
+        currentData + 6,
+        sample.humidity
+    );
+
+    currentCharacteristic.write(
+        currentData,
+        sizeof(currentData)
+    );
+}
+
+
+// ============================================================
+// STORE BATTERY SAMPLE
+// ============================================================
+
+void storeBatterySample(uint16_t millivolts)
+{
+    BatterySample sample;
+
+    sample.sequence = sequenceNumber;
+    sample.millivolts = millivolts;
+
+    batteryHistory[batteryHead] = sample;
+
+    batteryHead++;
+
+    if (batteryHead >= BATTERY_HISTORY_CAPACITY)
+    {
+        batteryHead = 0;
+    }
+
+    if (batteryCount < BATTERY_HISTORY_CAPACITY)
+    {
+        batteryCount++;
+    }
+
+    uint8_t data[6];
+
+    put32(
+        data,
+        sample.sequence
+    );
+
+    put16(
+        data + 4,
+        sample.millivolts
+    );
+
+    batteryCurrentCharacteristic.write(
+        data,
+        sizeof(data)
+    );
 }
 
 
 // ============================================================
 // METADATA
-//
-// 16 bytes:
-//
-// 0       protocol version = 2
-// 1       sensor ID
-// 2-3     environmental interval seconds
-// 4-5     environmental history count
-// 6-7     environmental history capacity
-// 8-11    newest sequence
-// 12-13   battery history count
-// 14-15   battery interval seconds
 // ============================================================
 
 void updateMetadata()
 {
-  uint8_t data[16] = {};
+    uint8_t data[16];
 
-  data[0] = 2;
-  data[1] = SENSOR_ID;
+    memset(
+        data,
+        0,
+        sizeof(data)
+    );
 
-  putLE16(&data[2], SAMPLE_INTERVAL_MS / 1000UL);
-  putLE16(&data[4], historyCount);
-  putLE16(&data[6], HISTORY_CAPACITY);
+    // Protocol version
 
-  uint32_t newest = 0;
+    data[0] = 3;
 
-  if (historyCount > 0) {
-    newest = getHistory(historyCount - 1).seq;
-  }
+    // Sensor ID
 
-  putLE32(&data[8], newest);
+    data[1] = SENSOR_ID;
 
-  putLE16(&data[12], batteryCount);
-  putLE16(&data[14], BATTERY_INTERVAL_MS / 1000UL);
+    // Environmental interval seconds
 
-  metaChar.write(data, sizeof(data));
-}
+    put16(
+        data + 2,
+        ENV_INTERVAL_MS / 1000
+    );
 
+    // Environmental history count
 
-// ============================================================
-// CURRENT ENVIRONMENT
-// ============================================================
+    put16(
+        data + 4,
+        envCount
+    );
 
-void updateCurrentCharacteristic()
-{
-  uint8_t data[8] = {};
+    // Environmental history capacity
 
-  if (haveSample) {
-    putLE32(&data[0], currentSample.seq);
-    putLE16(&data[4], (uint16_t)currentSample.temperature_centi);
-    putLE16(&data[6], currentSample.humidity_centi);
-  }
+    put16(
+        data + 6,
+        ENV_HISTORY_CAPACITY
+    );
 
-  currentChar.write(data, sizeof(data));
-}
+    // Newest sequence
 
+    put32(
+        data + 8,
+        sequenceNumber
+    );
 
-// ============================================================
-// CURRENT BATTERY
-//
-// 6 bytes:
-// sequence + millivolts
-// ============================================================
+    // Battery history count
 
-void updateBatteryCharacteristic()
-{
-  uint8_t data[6] = {};
+    put16(
+        data + 12,
+        batteryCount
+    );
 
-  if (haveBattery) {
-    putLE32(&data[0], currentBattery.seq);
-    putLE16(&data[4], currentBattery.millivolts);
-  }
+    // Battery interval seconds
 
-  batteryCurrentChar.write(data, sizeof(data));
-}
+    put16(
+        data + 14,
+        BATTERY_INTERVAL_MS / 1000
+    );
 
-
-// ============================================================
-// ENVIRONMENT HISTORY BLOCK
-// ============================================================
-
-void updateHistoryBlock()
-{
-  uint8_t data[4 + HISTORY_BLOCK_SAMPLES * 8];
-
-  uint16_t start = requestedHistoryIndex;
-
-  if (start > historyCount) {
-    start = historyCount;
-  }
-
-  uint16_t remaining = historyCount - start;
-
-  uint16_t count =
-    min(remaining, (uint16_t)HISTORY_BLOCK_SAMPLES);
-
-  putLE16(&data[0], start);
-  putLE16(&data[2], count);
-
-  uint16_t pos = 4;
-
-  for (uint16_t i = 0; i < count; i++) {
-
-    VMCSample s = getHistory(start + i);
-
-    putLE32(&data[pos], s.seq);
-    putLE16(&data[pos + 4], (uint16_t)s.temperature_centi);
-    putLE16(&data[pos + 6], s.humidity_centi);
-
-    pos += 8;
-  }
-
-  historyBlockChar.write(data, pos);
-}
-
-
-// ============================================================
-// BATTERY HISTORY BLOCK
-// ============================================================
-
-void updateBatteryBlock()
-{
-  uint8_t data[4 + BATTERY_BLOCK_SAMPLES * 6];
-
-  uint16_t start = requestedBatteryIndex;
-
-  if (start > batteryCount) {
-    start = batteryCount;
-  }
-
-  uint16_t remaining = batteryCount - start;
-
-  uint16_t count =
-    min(remaining, (uint16_t)BATTERY_BLOCK_SAMPLES);
-
-  putLE16(&data[0], start);
-  putLE16(&data[2], count);
-
-  uint16_t pos = 4;
-
-  for (uint16_t i = 0; i < count; i++) {
-
-    BatterySample s =
-      getBatteryHistory(start + i);
-
-    putLE32(&data[pos], s.seq);
-    putLE16(&data[pos + 4], s.millivolts);
-
-    pos += 6;
-  }
-
-  batteryBlockChar.write(data, pos);
-}
-
-
-// ============================================================
-// GATT WRITE CALLBACKS
-// ============================================================
-
-void historyIndexWritten(
-  uint16_t conn_hdl,
-  BLECharacteristic *chr,
-  uint8_t *data,
-  uint16_t len)
-{
-  (void)conn_hdl;
-  (void)chr;
-
-  if (len != 2) return;
-
-  requestedHistoryIndex = getLE16(data);
-
-  updateHistoryBlock();
-}
-
-
-void batteryIndexWritten(
-  uint16_t conn_hdl,
-  BLECharacteristic *chr,
-  uint8_t *data,
-  uint16_t len)
-{
-  (void)conn_hdl;
-  (void)chr;
-
-  if (len != 2) return;
-
-  requestedBatteryIndex = getLE16(data);
-
-  updateBatteryBlock();
-}
-
-
-// ============================================================
-// BATTERY MEASUREMENT
-// ============================================================
-
-uint16_t readBatteryMillivolts()
-{
-  analogReadResolution(12);
-
-  // nRF52840 internal VDDH/5 SAADC input.
-  // The ADC itself sees VDDH divided by 5.
-  uint32_t raw = analogReadVDDHDIV5();
-
-  // Default Adafruit SAADC range is 0..3.6 V.
-  // 12-bit ADC = 0..4095.
-  //
-  // Because VDDH is internally divided by 5:
-  //
-  // VDDH = ADC_voltage * 5
-
-  float millivolts =
-    ((float)raw * 3600.0f * 5.0f) / 4095.0f;
-
-  if (millivolts > 6000.0f) {
-    millivolts = 6000.0f;
-  }
-
-  return (uint16_t)roundf(millivolts);
-}
-
-
-void measureBattery()
-{
-  currentBattery.seq =
-    currentSample.seq;
-
-  currentBattery.millivolts =
-    readBatteryMillivolts();
-
-  haveBattery = true;
-
-  addBatteryHistory(currentBattery);
-
-  updateBatteryCharacteristic();
-
-  Serial.print("Battery = ");
-
-  Serial.print(
-    currentBattery.millivolts / 1000.0f,
-    3
-  );
-
-  Serial.println(" V");
-}
-
-
-// ============================================================
-// SHT40
-// ============================================================
-
-bool takeMeasurement()
-{
-  sensors_event_t humidity;
-  sensors_event_t temp;
-
-  sht4.getEvent(&humidity, &temp);
-
-  if (
-    isnan(temp.temperature) ||
-    isnan(humidity.relative_humidity)
-  ) {
-    Serial.println("SHT40 read failed");
-    return false;
-  }
-
-  currentSample.seq = nextSequence++;
-
-  currentSample.temperature_centi =
-    (int16_t)roundf(temp.temperature * 100.0f);
-
-  float rh = humidity.relative_humidity;
-
-  if (rh < 0.0f) rh = 0.0f;
-  if (rh > 100.0f) rh = 100.0f;
-
-  currentSample.humidity_centi =
-    (uint16_t)roundf(rh * 100.0f);
-
-  haveSample = true;
-
-  addHistory(currentSample);
-
-  updateCurrentCharacteristic();
-
-  Serial.print("#");
-  Serial.print(currentSample.seq);
-
-  Serial.print(" T=");
-  Serial.print(currentSample.temperature_centi / 100.0f, 2);
-
-  Serial.print("C RH=");
-  Serial.print(currentSample.humidity_centi / 100.0f, 2);
-
-  Serial.println("%");
-
-  return true;
-}
-
-
-// ============================================================
-// BLE CALLBACKS
-// ============================================================
-
-void connectCallback(uint16_t conn_hdl)
-{
-  clientConnected = true;
-
-  Serial.println("*** GATT CONNECTED ***");
-
-  BLEConnection *connection =
-    Bluefruit.Connection(conn_hdl);
-
-  if (connection) {
-    connection->requestMtuExchange(247);
-  }
-}
-
-
-void disconnectCallback(
-  uint16_t conn_hdl,
-  uint8_t reason)
-{
-  (void)conn_hdl;
-  (void)reason;
-
-  clientConnected = false;
-
-  Serial.println("*** GATT DISCONNECTED ***");
-
-  if (gattWindowOpen) {
-    Bluefruit.Advertising.stop();
-    gattWindowOpen = false;
-  }
+    metadataCharacteristic.write(
+        data,
+        sizeof(data)
+    );
 }
 
 
@@ -586,155 +464,646 @@ void disconnectCallback(
 // ADVERTISING
 // ============================================================
 
-bool startAdvertising()
+void startAdvertising()
 {
-  Bluefruit.Advertising.stop();
+    if (Bluefruit.connected())
+    {
+        return;
+    }
 
-  Bluefruit.Advertising.clearData();
-  Bluefruit.ScanResponse.clearData();
-
-  Bluefruit.Advertising.addFlags(
-    BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE
-  );
-
-  Bluefruit.Advertising.addTxPower();
-
-  uint8_t mfgData[] = {
-    0x59,
-    0x00,
-    SENSOR_ID
-  };
-
-  Bluefruit.Advertising.addManufacturerData(
-    mfgData,
-    sizeof(mfgData)
-  );
-
-  Bluefruit.Advertising.addName();
-
-  Bluefruit.Advertising.setType(
-    BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED
-  );
-
-  // ~100 ms while the short advertising window is open.
-  Bluefruit.Advertising.setInterval(160, 160);
-
-  Bluefruit.Advertising.setFastTimeout(0);
-
-  return Bluefruit.Advertising.start(0);
-}
-
-
-void openGattWindow()
-{
-  if (clientConnected) return;
-
-  if (!startAdvertising()) {
-    Serial.println("Advertising start failed");
-    return;
-  }
-
-  gattWindowOpen = true;
-  gattWindowStarted = millis();
-
-  Serial.println("BLE window OPEN");
-}
-
-
-void serviceGattWindow()
-{
-  if (!gattWindowOpen) return;
-
-  // Once connected, allow the GATT transfer to take as long
-  // as necessary.
-  if (clientConnected) return;
-
-  if (
-    (uint32_t)(millis() - gattWindowStarted)
-      >= GATT_WINDOW_MS
-  ) {
     Bluefruit.Advertising.stop();
 
-    gattWindowOpen = false;
+    Bluefruit.Advertising.clearData();
+    Bluefruit.ScanResponse.clearData();
 
-    Serial.println("BLE window CLOSED");
-  }
+    Bluefruit.Advertising.addFlags(
+        BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE
+    );
+
+    Bluefruit.Advertising.addTxPower();
+
+    Bluefruit.Advertising.addService(
+        vmcService
+    );
+
+    uint8_t manufacturerData[3] =
+    {
+        0x59,
+        0x00,
+        SENSOR_ID
+    };
+
+    Bluefruit.Advertising.addManufacturerData(
+        manufacturerData,
+        sizeof(manufacturerData)
+    );
+
+    Bluefruit.ScanResponse.addName();
+
+    Bluefruit.Advertising.setInterval(
+        160,
+        160
+    );
+
+    Bluefruit.Advertising.setFastTimeout(0);
+
+    Bluefruit.Advertising.start(
+        ADVERTISING_DURATION_SECONDS
+    );
 }
 
 
 // ============================================================
-// GATT SETUP
+// WRITE CALLBACKS
 // ============================================================
 
-void setupGatt()
+void historyIndexWriteCallback(
+    uint16_t connHandle,
+    BLECharacteristic *characteristic,
+    uint8_t *data,
+    uint16_t length
+)
 {
-  vmcService.begin();
+    (void)connHandle;
+    (void)characteristic;
 
-  // Metadata
-  metaChar.setProperties(CHR_PROPS_READ);
-  metaChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  metaChar.setFixedLen(16);
-  metaChar.begin();
+    if (length < 2)
+    {
+        return;
+    }
 
-  // Current T/RH
-  currentChar.setProperties(CHR_PROPS_READ);
-  currentChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  currentChar.setFixedLen(8);
-  currentChar.begin();
-
-  // Environment history index
-  historyIndexChar.setProperties(CHR_PROPS_WRITE);
-  historyIndexChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
-  historyIndexChar.setFixedLen(2);
-  historyIndexChar.setWriteCallback(historyIndexWritten);
-  historyIndexChar.begin();
-
-  // Environment history block
-  historyBlockChar.setProperties(CHR_PROPS_READ);
-  historyBlockChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  historyBlockChar.setMaxLen(
-    4 + HISTORY_BLOCK_SAMPLES * 8
-  );
-  historyBlockChar.begin();
-
-  // Current battery
-  batteryCurrentChar.setProperties(CHR_PROPS_READ);
-  batteryCurrentChar.setPermission(
-    SECMODE_OPEN,
-    SECMODE_NO_ACCESS
-  );
-  batteryCurrentChar.setFixedLen(6);
-  batteryCurrentChar.begin();
-
-  // Battery history index
-  batteryIndexChar.setProperties(CHR_PROPS_WRITE);
-  batteryIndexChar.setPermission(
-    SECMODE_NO_ACCESS,
-    SECMODE_OPEN
-  );
-  batteryIndexChar.setFixedLen(2);
-  batteryIndexChar.setWriteCallback(
-    batteryIndexWritten
-  );
-  batteryIndexChar.begin();
-
-  // Battery history block
-  batteryBlockChar.setProperties(CHR_PROPS_READ);
-  batteryBlockChar.setPermission(
-    SECMODE_OPEN,
-    SECMODE_NO_ACCESS
-  );
-  batteryBlockChar.setMaxLen(
-    4 + BATTERY_BLOCK_SAMPLES * 6
-  );
-  batteryBlockChar.begin();
-
-  updateMetadata();
-  updateCurrentCharacteristic();
-  updateBatteryCharacteristic();
-  updateHistoryBlock();
-  updateBatteryBlock();
+    envRequestedIndex = get16(data);
+    envStreamRequested = true;
 }
+
+
+void batteryIndexWriteCallback(
+    uint16_t connHandle,
+    BLECharacteristic *characteristic,
+    uint8_t *data,
+    uint16_t length
+)
+{
+    (void)connHandle;
+    (void)characteristic;
+
+    if (length < 2)
+    {
+        return;
+    }
+
+    batteryRequestedIndex = get16(data);
+    batteryStreamRequested = true;
+}
+
+
+// ============================================================
+// START ENVIRONMENT STREAM
+// ============================================================
+
+void beginEnvironmentStream()
+{
+    envStreamCount = envCount;
+
+    envStreamOldestPhysical =
+        envOldestPhysicalIndex();
+
+    uint16_t requested =
+        envRequestedIndex;
+
+    if (requested > envStreamCount)
+    {
+        requested = envStreamCount;
+    }
+
+    envStreamIndex = requested;
+
+    envStreaming =
+        envStreamIndex < envStreamCount;
+}
+
+
+// ============================================================
+// START BATTERY STREAM
+// ============================================================
+
+void beginBatteryStream()
+{
+    batteryStreamCount = batteryCount;
+
+    batteryStreamOldestPhysical =
+        batteryOldestPhysicalIndex();
+
+    uint16_t requested =
+        batteryRequestedIndex;
+
+    if (requested > batteryStreamCount)
+    {
+        requested = batteryStreamCount;
+    }
+
+    batteryStreamIndex = requested;
+
+    batteryStreaming =
+        batteryStreamIndex < batteryStreamCount;
+}
+
+
+// ============================================================
+// SEND ENVIRONMENT BLOCK
+// ============================================================
+
+void sendNextEnvironmentBlock()
+{
+    if (!envStreaming)
+    {
+        return;
+    }
+
+    if (!Bluefruit.connected())
+    {
+        envStreaming = false;
+        return;
+    }
+
+    uint16_t remaining =
+        envStreamCount - envStreamIndex;
+
+    uint16_t numberToSend =
+        remaining;
+
+    if (numberToSend > ENV_SAMPLES_PER_BLOCK)
+    {
+        numberToSend =
+            ENV_SAMPLES_PER_BLOCK;
+    }
+
+    uint8_t packet[ENV_BLOCK_MAX];
+
+    put16(
+        packet,
+        envStreamIndex
+    );
+
+    put16(
+        packet + 2,
+        numberToSend
+    );
+
+    uint16_t offset = 4;
+
+    for (
+        uint16_t i = 0;
+        i < numberToSend;
+        i++
+    )
+    {
+        uint16_t logicalIndex =
+            envStreamIndex + i;
+
+        uint16_t physicalIndex =
+            (
+                envStreamOldestPhysical
+                + logicalIndex
+            )
+            % ENV_HISTORY_CAPACITY;
+
+        EnvironmentSample &sample =
+            envHistory[physicalIndex];
+
+        put32(
+            packet + offset,
+            sample.sequence
+        );
+
+        put16(
+            packet + offset + 4,
+            (uint16_t)sample.temperature
+        );
+
+        put16(
+            packet + offset + 6,
+            sample.humidity
+        );
+
+        offset += 8;
+    }
+
+    bool sent =
+        historyBlockCharacteristic.notify(
+            packet,
+            offset
+        );
+
+    if (sent)
+    {
+        envStreamIndex += numberToSend;
+
+        if (envStreamIndex >= envStreamCount)
+        {
+            envStreaming = false;
+        }
+    }
+}
+
+
+// ============================================================
+// SEND BATTERY BLOCK
+// ============================================================
+
+void sendNextBatteryBlock()
+{
+    if (!batteryStreaming)
+    {
+        return;
+    }
+
+    if (!Bluefruit.connected())
+    {
+        batteryStreaming = false;
+        return;
+    }
+
+    uint16_t remaining =
+        batteryStreamCount
+        - batteryStreamIndex;
+
+    uint16_t numberToSend =
+        remaining;
+
+    if (
+        numberToSend
+        > BATTERY_SAMPLES_PER_BLOCK
+    )
+    {
+        numberToSend =
+            BATTERY_SAMPLES_PER_BLOCK;
+    }
+
+    uint8_t packet[BATTERY_BLOCK_MAX];
+
+    put16(
+        packet,
+        batteryStreamIndex
+    );
+
+    put16(
+        packet + 2,
+        numberToSend
+    );
+
+    uint16_t offset = 4;
+
+    for (
+        uint16_t i = 0;
+        i < numberToSend;
+        i++
+    )
+    {
+        uint16_t logicalIndex =
+            batteryStreamIndex + i;
+
+        uint16_t physicalIndex =
+            (
+                batteryStreamOldestPhysical
+                + logicalIndex
+            )
+            % BATTERY_HISTORY_CAPACITY;
+
+        BatterySample &sample =
+            batteryHistory[physicalIndex];
+
+        put32(
+            packet + offset,
+            sample.sequence
+        );
+
+        put16(
+            packet + offset + 4,
+            sample.millivolts
+        );
+
+        offset += 6;
+    }
+
+    bool sent =
+        batteryBlockCharacteristic.notify(
+            packet,
+            offset
+        );
+
+    if (sent)
+    {
+        batteryStreamIndex += numberToSend;
+
+        if (
+            batteryStreamIndex
+            >= batteryStreamCount
+        )
+        {
+            batteryStreaming = false;
+        }
+    }
+}
+
+
+// ============================================================
+// SENSOR MEASUREMENT
+// ============================================================
+
+void takeEnvironmentMeasurement()
+{
+    sensors_event_t humidityEvent;
+    sensors_event_t temperatureEvent;
+
+    sht4.getEvent(
+        &humidityEvent,
+        &temperatureEvent
+    );
+
+    int16_t temperature =
+        (int16_t)roundf(
+            temperatureEvent.temperature
+            * 100.0f
+        );
+
+    float rh =
+        humidityEvent.relative_humidity;
+
+    if (rh < 0.0f)
+    {
+        rh = 0.0f;
+    }
+
+    if (rh > 100.0f)
+    {
+        rh = 100.0f;
+    }
+
+    uint16_t humidity =
+        (uint16_t)roundf(
+            rh * 100.0f
+        );
+
+    storeEnvironmentSample(
+        temperature,
+        humidity
+    );
+
+    updateMetadata();
+
+    startAdvertising();
+}
+
+
+// ============================================================
+// BATTERY MEASUREMENT
+// ============================================================
+
+void takeBatteryMeasurement()
+{
+    uint16_t millivolts =
+        readBatteryMillivolts();
+
+    storeBatterySample(
+        millivolts
+    );
+
+    updateMetadata();
+}
+
+
+// ============================================================
+// SETUP BLE
+// ============================================================
+
+void setupBLE()
+{
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Configure the SoftDevice BEFORE Bluefruit.begin().
+    //
+    // BANDWIDTH_MAX configures the peripheral connection for
+    // high throughput and allows the larger ATT MTU.
+    // --------------------------------------------------------
+
+    Bluefruit.configPrphBandwidth(
+        BANDWIDTH_MAX
+    );
+
+    Bluefruit.begin(
+        1,
+        0
+    );
+
+    Bluefruit.autoConnLed(
+        false
+    );
+
+    pinMode(
+        LED_BUILTIN,
+        OUTPUT
+    );
+
+    ledOff(
+        LED_BUILTIN
+    );
+
+    Bluefruit.setTxPower(
+        4
+    );
+
+    Bluefruit.setName(
+        SENSOR_NAME
+    );
+
+
+    // --------------------------------------------------------
+    // Connection interval
+    //
+    // Keep this fairly conservative for the first MTU test.
+    // 12 units = 15 ms
+    // 24 units = 30 ms
+    // --------------------------------------------------------
+
+    Bluefruit.Periph.setConnInterval(
+        12,
+        24
+    );
+
+
+    // ========================================================
+    // SERVICE
+    // ========================================================
+
+    vmcService.begin();
+
+
+    // ========================================================
+    // METADATA
+    // ========================================================
+
+    metadataCharacteristic.setProperties(
+        CHR_PROPS_READ
+    );
+
+    metadataCharacteristic.setPermission(
+        SECMODE_OPEN,
+        SECMODE_NO_ACCESS
+    );
+
+    metadataCharacteristic.setFixedLen(
+        16
+    );
+
+    metadataCharacteristic.begin();
+
+
+    // ========================================================
+    // CURRENT ENVIRONMENT
+    // ========================================================
+
+    currentCharacteristic.setProperties(
+        CHR_PROPS_READ
+    );
+
+    currentCharacteristic.setPermission(
+        SECMODE_OPEN,
+        SECMODE_NO_ACCESS
+    );
+
+    currentCharacteristic.setFixedLen(
+        8
+    );
+
+    currentCharacteristic.begin();
+
+
+    // ========================================================
+    // ENVIRONMENT HISTORY COMMAND
+    // ========================================================
+
+    historyIndexCharacteristic.setProperties(
+        CHR_PROPS_WRITE
+    );
+
+    historyIndexCharacteristic.setPermission(
+        SECMODE_NO_ACCESS,
+        SECMODE_OPEN
+    );
+
+    historyIndexCharacteristic.setFixedLen(
+        2
+    );
+
+    historyIndexCharacteristic.setWriteCallback(
+        historyIndexWriteCallback
+    );
+
+    historyIndexCharacteristic.begin();
+
+
+    // ========================================================
+    // ENVIRONMENT HISTORY NOTIFICATION
+    //
+    // VARIABLE LENGTH IS IMPORTANT.
+    //
+    // Maximum:
+    //     244 bytes
+    //
+    // Last packet can be shorter.
+    // ========================================================
+
+    historyBlockCharacteristic.setProperties(
+        CHR_PROPS_NOTIFY
+    );
+
+    historyBlockCharacteristic.setPermission(
+        SECMODE_OPEN,
+        SECMODE_NO_ACCESS
+    );
+
+    historyBlockCharacteristic.setMaxLen(
+        ENV_BLOCK_MAX
+    );
+
+    historyBlockCharacteristic.begin();
+
+
+    // ========================================================
+    // CURRENT BATTERY
+    // ========================================================
+
+    batteryCurrentCharacteristic.setProperties(
+        CHR_PROPS_READ
+    );
+
+    batteryCurrentCharacteristic.setPermission(
+        SECMODE_OPEN,
+        SECMODE_NO_ACCESS
+    );
+
+    batteryCurrentCharacteristic.setFixedLen(
+        6
+    );
+
+    batteryCurrentCharacteristic.begin();
+
+
+    // ========================================================
+    // BATTERY HISTORY COMMAND
+    // ========================================================
+
+    batteryIndexCharacteristic.setProperties(
+        CHR_PROPS_WRITE
+    );
+
+    batteryIndexCharacteristic.setPermission(
+        SECMODE_NO_ACCESS,
+        SECMODE_OPEN
+    );
+
+    batteryIndexCharacteristic.setFixedLen(
+        2
+    );
+
+    batteryIndexCharacteristic.setWriteCallback(
+        batteryIndexWriteCallback
+    );
+
+    batteryIndexCharacteristic.begin();
+
+
+    // ========================================================
+    // BATTERY HISTORY NOTIFICATION
+    //
+    // VARIABLE LENGTH.
+    // ========================================================
+
+    batteryBlockCharacteristic.setProperties(
+        CHR_PROPS_NOTIFY
+    );
+
+    batteryBlockCharacteristic.setPermission(
+        SECMODE_OPEN,
+        SECMODE_NO_ACCESS
+    );
+
+    batteryBlockCharacteristic.setMaxLen(
+        BATTERY_BLOCK_MAX
+    );
+
+    batteryBlockCharacteristic.begin();
+
+
+    // Initial characteristic values
+
+    updateMetadata();
+
+    startAdvertising();
+}
+
 
 
 // ============================================================
@@ -743,67 +1112,75 @@ void setupGatt()
 
 void setup()
 {
-  // Built-in LED OFF
-  Bluefruit.autoConnLed(false);
-  pinMode(LED_BUILTIN, OUTPUT);
-  ledOff(LED_BUILTIN);
+    pinMode(
+        LED_BUILTIN,
+        OUTPUT
+    );
 
-  Serial.begin(115200);
+    ledOff(
+        LED_BUILTIN
+    );
 
-  uint32_t start = millis();
 
-  while (!Serial && millis() - start < 3000UL) {
-    delay(10);
-  }
+    // --------------------------------------------------------
+    // I2C
+    // --------------------------------------------------------
 
-  Serial.println();
-  Serial.println("==============================");
-  Serial.println(SENSOR_NAME);
-  Serial.println("==============================");
+    Wire.begin();
 
-  // I2C
-  Wire.setPins(2, 3);
-  Wire.begin();
+    if (!sht4.begin())
+    {
+        // No Serial/debug in the low-power build.
+        // Stay here if the sensor cannot be initialized.
 
-  if (!sht4.begin(&Wire)) {
-    Serial.println("ERROR: SHT40 not found");
+        while (true)
+        {
+            ledOff(
+                LED_BUILTIN
+            );
 
-    while (1) {
-      delay(1000);
+            vTaskDelay(
+                pdMS_TO_TICKS(1000)
+            );
+        }
     }
-  }
 
-  // Lower-energy measurement than high precision.
-  sht4.setPrecision(SHT4X_MED_PRECISION);
 
-  // Heater explicitly disabled.
-  sht4.setHeater(SHT4X_NO_HEATER);
+    // --------------------------------------------------------
+    // SHT40 configuration
+    // --------------------------------------------------------
 
-  Serial.println("SHT40 OK - heater OFF");
+    sht4.setPrecision(
+        SHT4X_MED_PRECISION
+    );
 
-  // BLE
-  Bluefruit.begin(1, 0);
+    sht4.setHeater(
+        SHT4X_NO_HEATER
+    );
 
-  Bluefruit.setTxPower(4);
-  Bluefruit.setName(SENSOR_NAME);
 
-  Bluefruit.Periph.setConnectCallback(connectCallback);
-  Bluefruit.Periph.setDisconnectCallback(disconnectCallback);
+    // --------------------------------------------------------
+    // BLE
+    // --------------------------------------------------------
 
-  setupGatt();
+    setupBLE();
 
-  Serial.println("BLE OK");
-  Serial.println("Sample: 1 minute");
-  Serial.println("Battery: 10 minutes");
-  Serial.println("BLE window: 2 seconds");
 
-  // First environmental sample immediately.
-  lastMeasurementTime =
-    millis() - SAMPLE_INTERVAL_MS;
+    // --------------------------------------------------------
+    // First measurements immediately
+    // --------------------------------------------------------
 
-  // First battery measurement immediately.
-  lastBatteryTime =
-    millis() - BATTERY_INTERVAL_MS;
+    takeEnvironmentMeasurement();
+
+    takeBatteryMeasurement();
+
+    uint32_t now = millis();
+
+    lastEnvironmentMeasurement =
+        now;
+
+    lastBatteryMeasurement =
+        now;
 }
 
 
@@ -813,37 +1190,82 @@ void setup()
 
 void loop()
 {
-  serviceGattWindow();
+    // --------------------------------------------------------
+    // Start requested streams
+    // --------------------------------------------------------
 
-  uint32_t now = millis();
+    if (envStreamRequested)
+    {
+        envStreamRequested = false;
 
-  if (
-    (uint32_t)(now - lastMeasurementTime)
-      >= SAMPLE_INTERVAL_MS
-  ) {
-    lastMeasurementTime = now;
-
-    if (takeMeasurement()) {
-
-      // Battery every ten minutes.
-      if (
-        !haveBattery ||
-        (uint32_t)(now - lastBatteryTime)
-          >= BATTERY_INTERVAL_MS
-      ) {
-        lastBatteryTime = now;
-
-        measureBattery();
-      }
-
-      updateMetadata();
-
-      if (!clientConnected) {
-        openGattWindow();
-      }
+        beginEnvironmentStream();
     }
-  }
 
-  // Keep this delay-free for now because that is the
-  // configuration already proven reliable on this board.
+
+    if (batteryStreamRequested)
+    {
+        batteryStreamRequested = false;
+
+        beginBatteryStream();
+    }
+
+
+    // --------------------------------------------------------
+    // Stream data
+    //
+    // Environment gets priority.
+    // --------------------------------------------------------
+
+    if (envStreaming)
+    {
+        sendNextEnvironmentBlock();
+    }
+    else if (batteryStreaming)
+    {
+        sendNextBatteryBlock();
+    }
+
+
+    // --------------------------------------------------------
+    // Measurements
+    // --------------------------------------------------------
+
+    uint32_t now = millis();
+
+
+    if (
+        (uint32_t)(
+            now - lastEnvironmentMeasurement
+        )
+        >= ENV_INTERVAL_MS
+    )
+    {
+        lastEnvironmentMeasurement +=
+            ENV_INTERVAL_MS;
+
+        takeEnvironmentMeasurement();
+    }
+
+
+    if (
+        (uint32_t)(
+            now - lastBatteryMeasurement
+        )
+        >= BATTERY_INTERVAL_MS
+    )
+    {
+        lastBatteryMeasurement +=
+            BATTERY_INTERVAL_MS;
+
+        takeBatteryMeasurement();
+    }
+
+
+    // --------------------------------------------------------
+    // Give FreeRTOS / SoftDevice an idle opportunity.
+    // --------------------------------------------------------
+
+    vTaskDelay(
+        pdMS_TO_TICKS(1)
+    );
 }

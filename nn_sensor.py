@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 
-# source ~/vmc-venv/bin/activate to load the appropriate env
-
 import asyncio
 import csv
 import struct
+import time
 from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
@@ -14,44 +13,33 @@ from bleak import BleakClient, BleakScanner
 
 
 # ============================================================
-# CONFIGURATION
+# SENSOR
 # ============================================================
 
 SENSOR_ID = 1
-SENSOR_NAME = "NNTempHumidity1"
+SENSOR_NAME = "NNTempHumidityRed"
 
 COMPANY_ID = 0x0059
 
-SCAN_TIMEOUT = 70.0
+SCAN_TIMEOUT = 75.0
+CONNECT_TIMEOUT = 15.0
+STREAM_TIMEOUT = 30.0
 
-CSV_FILENAME = "NNTempHumidity1_history.csv"
-BATTERY_CSV_FILENAME = "NNTempHumidity1_battery.csv"
+CSV_FILENAME = "green_history.csv"
+BATTERY_CSV_FILENAME = "green_battery.csv"
 
 
 # ============================================================
 # UUIDs
 # ============================================================
 
-META_UUID = \
-    "7a100001-4c7f-4f4d-432d-564d4353454e"
+META_UUID = "7a100001-4c7f-4f4d-432d-564d4353454e"
 
-CURRENT_UUID = \
-    "7a100002-4c7f-4f4d-432d-564d4353454e"
+HISTORY_INDEX_UUID = "7a100003-4c7f-4f4d-432d-564d4353454e"
+HISTORY_BLOCK_UUID = "7a100004-4c7f-4f4d-432d-564d4353454e"
 
-HISTORY_INDEX_UUID = \
-    "7a100003-4c7f-4f4d-432d-564d4353454e"
-
-HISTORY_BLOCK_UUID = \
-    "7a100004-4c7f-4f4d-432d-564d4353454e"
-
-BATTERY_CURRENT_UUID = \
-    "7a100005-4c7f-4f4d-432d-564d4353454e"
-
-BATTERY_INDEX_UUID = \
-    "7a100006-4c7f-4f4d-432d-564d4353454e"
-
-BATTERY_BLOCK_UUID = \
-    "7a100007-4c7f-4f4d-432d-564d4353454e"
+BATTERY_INDEX_UUID = "7a100006-4c7f-4f4d-432d-564d4353454e"
+BATTERY_BLOCK_UUID = "7a100007-4c7f-4f4d-432d-564d4353454e"
 
 
 # ============================================================
@@ -61,41 +49,19 @@ BATTERY_BLOCK_UUID = \
 async def find_sensor():
 
     print()
-    print(f"Scanning for {SENSOR_NAME}...")
-    print(
-        f"Manufacturer 0x{COMPANY_ID:04X}, "
-        f"sensor ID {SENSOR_ID}"
-    )
-
-    print(
-        "The sensor advertises for 2 seconds "
-        "once per minute."
-    )
+    print(f"Scanning for {SENSOR_NAME} (ID {SENSOR_ID})...")
 
     def match(device, advertisement):
 
-        manufacturer_data = (
-            advertisement.manufacturer_data
-        )
+        data = advertisement.manufacturer_data.get(COMPANY_ID)
 
-        if COMPANY_ID not in manufacturer_data:
+        if not data:
             return False
-
-        data = manufacturer_data[COMPANY_ID]
 
         if len(data) < 1:
             return False
 
-        if data[0] != SENSOR_ID:
-            return False
-
-        print()
-        print("Sensor found!")
-        print(f"  Address   : {device.address}")
-        print(f"  BLE name  : {advertisement.local_name}")
-        print(f"  Sensor ID : {data[0]}")
-
-        return True
+        return data[0] == SENSOR_ID
 
     device = await BleakScanner.find_device_by_filter(
         match,
@@ -104,350 +70,377 @@ async def find_sensor():
 
     if device is None:
         raise RuntimeError(
-            f"Sensor ID {SENSOR_ID} was not found "
+            f"Sensor ID {SENSOR_ID} not found "
             f"within {SCAN_TIMEOUT:.0f} seconds."
         )
+
+    print(f"Found: {device.address}")
 
     return device
 
 
 # ============================================================
-# METADATA
+# PARSERS
 # ============================================================
 
 def parse_metadata(data):
 
-    if len(data) < 16:
+    if len(data) != 16:
         raise RuntimeError(
-            f"Expected 16 metadata bytes, got {len(data)}."
+            f"Metadata should be 16 bytes; got {len(data)}."
         )
 
     return {
         "protocol_version": data[0],
         "sensor_id": data[1],
-
-        "sample_interval":
-            struct.unpack_from("<H", data, 2)[0],
-
-        "history_count":
-            struct.unpack_from("<H", data, 4)[0],
-
-        "history_capacity":
-            struct.unpack_from("<H", data, 6)[0],
-
-        "newest_sequence":
-            struct.unpack_from("<I", data, 8)[0],
-
-        "battery_count":
-            struct.unpack_from("<H", data, 12)[0],
-
-        "battery_interval":
-            struct.unpack_from("<H", data, 14)[0],
+        "sample_interval": struct.unpack_from("<H", data, 2)[0],
+        "history_count": struct.unpack_from("<H", data, 4)[0],
+        "history_capacity": struct.unpack_from("<H", data, 6)[0],
+        "newest_sequence": struct.unpack_from("<I", data, 8)[0],
+        "battery_count": struct.unpack_from("<H", data, 12)[0],
+        "battery_interval": struct.unpack_from("<H", data, 14)[0],
     }
 
 
-# ============================================================
-# ENVIRONMENT SAMPLE
-# ============================================================
+def parse_environment(data, offset=0):
 
-def parse_sample(data, offset=0):
-
-    seq, temp_raw, humidity_raw = struct.unpack_from(
+    sequence, temperature, humidity = struct.unpack_from(
         "<IhH",
         data,
         offset,
     )
 
     return {
-        "sequence": seq,
-        "temperature": temp_raw / 100.0,
-        "humidity": humidity_raw / 100.0,
+        "sequence": sequence,
+        "temperature": temperature / 100.0,
+        "humidity": humidity / 100.0,
     }
 
 
-# ============================================================
-# BATTERY SAMPLE
-# ============================================================
-
 def parse_battery(data, offset=0):
 
-    seq, millivolts = struct.unpack_from(
+    sequence, millivolts = struct.unpack_from(
         "<IH",
         data,
         offset,
     )
 
     return {
-        "sequence": seq,
+        "sequence": sequence,
         "millivolts": millivolts,
         "voltage": millivolts / 1000.0,
     }
 
 
 # ============================================================
-# ENVIRONMENT HISTORY BLOCK
+# ENVIRONMENT STREAM
 # ============================================================
 
-async def read_history_block(client, start_index):
+async def download_environment(client, expected_count):
 
-    await client.write_gatt_char(
-        HISTORY_INDEX_UUID,
-        struct.pack("<H", start_index),
-        response=True,
-    )
-
-    await asyncio.sleep(0.05)
-
-    data = await client.read_gatt_char(
-        HISTORY_BLOCK_UUID
-    )
-
-    if len(data) < 4:
-        raise RuntimeError(
-            "Environment history response too short."
-        )
-
-    returned_start, count = struct.unpack_from(
-        "<HH",
-        data,
-        0,
-    )
-
-    expected = 4 + count * 8
-
-    if len(data) < expected:
-        raise RuntimeError(
-            f"Incomplete environment history block: "
-            f"expected {expected}, got {len(data)}."
-        )
+    if expected_count == 0:
+        return [], 0.0
 
     samples = []
+    complete = asyncio.Event()
+    stream_error = None
 
-    offset = 4
+    def handler(sender, data):
 
-    for _ in range(count):
+        nonlocal stream_error
 
-        samples.append(
-            parse_sample(data, offset)
-        )
+        try:
 
-        offset += 8
+            if len(data) < 4:
+                raise RuntimeError(
+                    "Environment notification too short."
+                )
 
-    return returned_start, samples
+            start_index, count = struct.unpack_from(
+                "<HH",
+                data,
+                0,
+            )
 
+            required_length = 4 + count * 8
 
-# ============================================================
-# BATTERY HISTORY BLOCK
-# ============================================================
+            if len(data) != required_length:
+                raise RuntimeError(
+                    "Environment packet length error: "
+                    f"expected {required_length}, "
+                    f"received {len(data)}."
+                )
 
-async def read_battery_block(client, start_index):
+            if start_index != len(samples):
+                raise RuntimeError(
+                    "Environment stream out of sequence: "
+                    f"expected index {len(samples)}, "
+                    f"received {start_index}."
+                )
 
-    await client.write_gatt_char(
-        BATTERY_INDEX_UUID,
-        struct.pack("<H", start_index),
-        response=True,
-    )
+            offset = 4
 
-    await asyncio.sleep(0.05)
+            for _ in range(count):
 
-    data = await client.read_gatt_char(
-        BATTERY_BLOCK_UUID
-    )
+                samples.append(
+                    parse_environment(
+                        data,
+                        offset,
+                    )
+                )
 
-    if len(data) < 4:
-        raise RuntimeError(
-            "Battery history response too short."
-        )
+                offset += 8
 
-    returned_start, count = struct.unpack_from(
-        "<HH",
-        data,
-        0,
-    )
+            print(
+                f"\rEnvironment: "
+                f"{len(samples)}/{expected_count}",
+                end="",
+                flush=True,
+            )
 
-    expected = 4 + count * 6
+            if len(samples) >= expected_count:
+                complete.set()
 
-    if len(data) < expected:
-        raise RuntimeError(
-            f"Incomplete battery history block: "
-            f"expected {expected}, got {len(data)}."
-        )
+        except Exception as exc:
 
-    samples = []
-
-    offset = 4
-
-    for _ in range(count):
-
-        samples.append(
-            parse_battery(data, offset)
-        )
-
-        offset += 6
-
-    return returned_start, samples
-
-
-# ============================================================
-# DOWNLOAD ENVIRONMENT HISTORY
-# ============================================================
-
-async def download_history(client, count):
+            stream_error = exc
+            complete.set()
 
     print()
-    print(f"Downloading {count} environmental samples...")
+    print("Subscribing to environmental notifications...")
 
-    samples = []
+    await client.start_notify(
+        HISTORY_BLOCK_UUID,
+        handler,
+    )
 
-    index = 0
+    print("Subscription active.")
+    print("Requesting environmental stream...")
 
-    while index < count:
+    start_time = time.monotonic()
 
-        returned_start, block = (
-            await read_history_block(
-                client,
-                index,
-            )
+    try:
+
+        # One write starts the entire stream.
+        await client.write_gatt_char(
+            HISTORY_INDEX_UUID,
+            struct.pack("<H", 0),
+            response=True,
         )
 
-        if returned_start != index:
-            raise RuntimeError(
-                f"Requested environment index {index}, "
-                f"sensor returned {returned_start}."
-            )
-
-        if not block:
-            break
-
-        samples.extend(block)
-
-        index += len(block)
-
-        print(
-            f"\r  {len(samples)}/{count}",
-            end="",
-            flush=True,
+        await asyncio.wait_for(
+            complete.wait(),
+            timeout=STREAM_TIMEOUT,
         )
+
+    except asyncio.TimeoutError:
+
+        raise RuntimeError(
+            "Environment stream timed out. "
+            f"Received {len(samples)}/{expected_count} samples."
+        )
+
+    finally:
+
+        try:
+            await client.stop_notify(
+                HISTORY_BLOCK_UUID
+            )
+        except Exception:
+            pass
+
+    elapsed = time.monotonic() - start_time
 
     print()
 
-    return samples[:count]
+    if stream_error is not None:
+        raise stream_error
+
+    if len(samples) != expected_count:
+        raise RuntimeError(
+            "Environment stream incomplete: "
+            f"{len(samples)}/{expected_count} samples."
+        )
+
+    return samples, elapsed
 
 
 # ============================================================
-# DOWNLOAD BATTERY HISTORY
+# BATTERY STREAM
 # ============================================================
 
-async def download_battery_history(client, count):
+async def download_battery(client, expected_count):
 
-    print()
-    print(f"Downloading {count} battery samples...")
+    if expected_count == 0:
+        return [], 0.0
 
     samples = []
+    complete = asyncio.Event()
+    stream_error = None
 
-    index = 0
+    def handler(sender, data):
 
-    while index < count:
+        nonlocal stream_error
 
-        returned_start, block = (
-            await read_battery_block(
-                client,
-                index,
+        try:
+
+            if len(data) < 4:
+                raise RuntimeError(
+                    "Battery notification too short."
+                )
+
+            start_index, count = struct.unpack_from(
+                "<HH",
+                data,
+                0,
             )
+
+            required_length = 4 + count * 6
+
+            if len(data) != required_length:
+                raise RuntimeError(
+                    "Battery packet length error: "
+                    f"expected {required_length}, "
+                    f"received {len(data)}."
+                )
+
+            if start_index != len(samples):
+                raise RuntimeError(
+                    "Battery stream out of sequence: "
+                    f"expected index {len(samples)}, "
+                    f"received {start_index}."
+                )
+
+            offset = 4
+
+            for _ in range(count):
+
+                samples.append(
+                    parse_battery(
+                        data,
+                        offset,
+                    )
+                )
+
+                offset += 6
+
+            print(
+                f"\rBattery: "
+                f"{len(samples)}/{expected_count}",
+                end="",
+                flush=True,
+            )
+
+            if len(samples) >= expected_count:
+                complete.set()
+
+        except Exception as exc:
+
+            stream_error = exc
+            complete.set()
+
+    print()
+    print("Subscribing to battery notifications...")
+
+    await client.start_notify(
+        BATTERY_BLOCK_UUID,
+        handler,
+    )
+
+    print("Subscription active.")
+    print("Requesting battery stream...")
+
+    start_time = time.monotonic()
+
+    try:
+
+        await client.write_gatt_char(
+            BATTERY_INDEX_UUID,
+            struct.pack("<H", 0),
+            response=True,
         )
 
-        if returned_start != index:
-            raise RuntimeError(
-                f"Requested battery index {index}, "
-                f"sensor returned {returned_start}."
-            )
-
-        if not block:
-            break
-
-        samples.extend(block)
-
-        index += len(block)
-
-        print(
-            f"\r  {len(samples)}/{count}",
-            end="",
-            flush=True,
+        await asyncio.wait_for(
+            complete.wait(),
+            timeout=STREAM_TIMEOUT,
         )
+
+    except asyncio.TimeoutError:
+
+        raise RuntimeError(
+            "Battery stream timed out. "
+            f"Received {len(samples)}/{expected_count} samples."
+        )
+
+    finally:
+
+        try:
+            await client.stop_notify(
+                BATTERY_BLOCK_UUID
+            )
+        except Exception:
+            pass
+
+    elapsed = time.monotonic() - start_time
 
     print()
 
-    return samples[:count]
+    if stream_error is not None:
+        raise stream_error
+
+    if len(samples) != expected_count:
+        raise RuntimeError(
+            "Battery stream incomplete: "
+            f"{len(samples)}/{expected_count} samples."
+        )
+
+    return samples, elapsed
 
 
 # ============================================================
 # TIMESTAMPS
 # ============================================================
 
-def add_timestamps(
-    environment,
-    batteries,
-    sample_interval,
-):
+def add_timestamps(environment, batteries, interval):
 
     if not environment:
         return
 
     newest_time = datetime.now()
-
-    newest_sequence = (
-        environment[-1]["sequence"]
-    )
+    newest_sequence = environment[-1]["sequence"]
 
     for sample in environment:
 
-        delta_sequences = (
-            newest_sequence -
-            sample["sequence"]
+        sequence_difference = (
+            newest_sequence - sample["sequence"]
         )
 
         sample["timestamp"] = (
-            newest_time -
-            timedelta(
-                seconds=(
-                    delta_sequences *
-                    sample_interval
-                )
+            newest_time
+            - timedelta(
+                seconds=sequence_difference * interval
             )
         )
 
-    # Battery samples contain the environmental sequence number
-    # at which the battery reading was made, so they can use
-    # exactly the same time base.
+    for sample in batteries:
 
-    for battery in batteries:
-
-        delta_sequences = (
-            newest_sequence -
-            battery["sequence"]
+        sequence_difference = (
+            newest_sequence - sample["sequence"]
         )
 
-        battery["timestamp"] = (
-            newest_time -
-            timedelta(
-                seconds=(
-                    delta_sequences *
-                    sample_interval
-                )
+        sample["timestamp"] = (
+            newest_time
+            - timedelta(
+                seconds=sequence_difference * interval
             )
         )
 
 
 # ============================================================
-# APPROXIMATE LIPO %
+# BATTERY %
 # ============================================================
 
 def battery_percent(voltage):
-
-    # Approximate resting single-cell LiPo curve.
-    #
-    # Voltage remains the useful measured quantity.
-    # Percentage is deliberately only an estimate.
 
     curve = [
         (3.20, 0),
@@ -478,20 +471,17 @@ def battery_percent(voltage):
         if v1 <= voltage <= v2:
 
             fraction = (
-                (voltage - v1) /
-                (v2 - v1)
+                (voltage - v1)
+                / (v2 - v1)
             )
 
-            return (
-                p1 +
-                fraction * (p2 - p1)
-            )
+            return p1 + fraction * (p2 - p1)
 
     return 0.0
 
 
 # ============================================================
-# SAVE ENVIRONMENT CSV
+# CSV
 # ============================================================
 
 def save_environment_csv(samples):
@@ -511,23 +501,19 @@ def save_environment_csv(samples):
             "humidity_percent",
         ])
 
-        for s in samples:
+        for sample in samples:
 
             writer.writerow([
-                s["timestamp"].isoformat(
+                sample["timestamp"].isoformat(
                     timespec="seconds"
                 ),
-                s["sequence"],
-                f'{s["temperature"]:.2f}',
-                f'{s["humidity"]:.2f}',
+                sample["sequence"],
+                f'{sample["temperature"]:.2f}',
+                f'{sample["humidity"]:.2f}',
             ])
 
     print(f"Saved {CSV_FILENAME}")
 
-
-# ============================================================
-# SAVE BATTERY CSV
-# ============================================================
 
 def save_battery_csv(samples):
 
@@ -547,20 +533,16 @@ def save_battery_csv(samples):
             "estimated_percent",
         ])
 
-        for s in samples:
-
-            percent = battery_percent(
-                s["voltage"]
-            )
+        for sample in samples:
 
             writer.writerow([
-                s["timestamp"].isoformat(
+                sample["timestamp"].isoformat(
                     timespec="seconds"
                 ),
-                s["sequence"],
-                f'{s["voltage"]:.3f}',
-                s["millivolts"],
-                f"{percent:.1f}",
+                sample["sequence"],
+                f'{sample["voltage"]:.3f}',
+                sample["millivolts"],
+                f'{battery_percent(sample["voltage"]):.1f}',
             ])
 
     print(f"Saved {BATTERY_CSV_FILENAME}")
@@ -575,29 +557,29 @@ def show_graph(environment, batteries):
     if not environment:
         return
 
-    env_times = [
-        s["timestamp"]
-        for s in environment
+    times = [
+        sample["timestamp"]
+        for sample in environment
     ]
 
     temperatures = [
-        s["temperature"]
-        for s in environment
+        sample["temperature"]
+        for sample in environment
     ]
 
     humidities = [
-        s["humidity"]
-        for s in environment
+        sample["humidity"]
+        for sample in environment
     ]
 
     battery_times = [
-        s["timestamp"]
-        for s in batteries
+        sample["timestamp"]
+        for sample in batteries
     ]
 
     voltages = [
-        s["voltage"]
-        for s in batteries
+        sample["voltage"]
+        for sample in batteries
     ]
 
     fig, axes = plt.subplots(
@@ -608,40 +590,30 @@ def show_graph(environment, batteries):
     )
 
     fig.suptitle(
-        f"{SENSOR_NAME} — 24-hour history"
+        "Green sensor history"
     )
 
-    # --------------------------------------------------------
-    # Temperature
-    # --------------------------------------------------------
-
     axes[0].plot(
-        env_times,
+        times,
         temperatures,
         marker=".",
+        color="green",
     )
 
     axes[0].set_ylabel("°C")
     axes[0].set_title("Temperature")
     axes[0].grid(True, alpha=0.3)
 
-    # --------------------------------------------------------
-    # Humidity
-    # --------------------------------------------------------
-
     axes[1].plot(
-        env_times,
+        times,
         humidities,
         marker=".",
+        color="green",
     )
 
     axes[1].set_ylabel("% RH")
     axes[1].set_title("Relative humidity")
     axes[1].grid(True, alpha=0.3)
-
-    # --------------------------------------------------------
-    # Battery
-    # --------------------------------------------------------
 
     if batteries:
 
@@ -650,11 +622,12 @@ def show_graph(environment, batteries):
             voltages,
             marker="o",
             markersize=4,
+            color="green",
         )
 
     axes[2].set_ylabel("Volts")
-    axes[2].set_title("Battery voltage")
     axes[2].set_xlabel("Time")
+    axes[2].set_title("Battery voltage")
     axes[2].grid(True, alpha=0.3)
 
     locator = mdates.AutoDateLocator()
@@ -673,9 +646,6 @@ def show_graph(environment, batteries):
 
     fig.tight_layout()
 
-    print()
-    print("Opening graph...")
-
     plt.show()
 
 
@@ -687,7 +657,7 @@ async def main():
 
     print()
     print("======================================")
-    print("NN Temperature / Humidity / Battery")
+    print("VMC — Green streaming test")
     print("======================================")
 
     device = await find_sensor()
@@ -697,138 +667,174 @@ async def main():
 
     async with BleakClient(
         device,
-        timeout=15.0,
+        timeout=CONNECT_TIMEOUT,
     ) as client:
 
         print("Connected.")
 
         # ----------------------------------------------------
-        # Metadata
+        # METADATA ONLY
         # ----------------------------------------------------
 
-        raw = await client.read_gatt_char(
+        raw_metadata = await client.read_gatt_char(
             META_UUID
         )
 
-        meta = parse_metadata(raw)
+        meta = parse_metadata(
+            raw_metadata
+        )
 
         print()
         print("Sensor information")
         print("------------------")
+
         print(
             f'Protocol version : '
             f'{meta["protocol_version"]}'
         )
+
         print(
             f'Sensor ID        : '
             f'{meta["sensor_id"]}'
         )
+
         print(
             f'Sample interval  : '
             f'{meta["sample_interval"]} seconds'
         )
+
         print(
             f'Environment      : '
             f'{meta["history_count"]}/'
             f'{meta["history_capacity"]}'
         )
+
+        print(
+            f'Newest sequence  : '
+            f'{meta["newest_sequence"]}'
+        )
+
         print(
             f'Battery samples  : '
             f'{meta["battery_count"]}'
         )
-        print(
-            f'Battery interval : '
-            f'{meta["battery_interval"]} seconds'
-        )
 
-        # ----------------------------------------------------
-        # Current environment
-        # ----------------------------------------------------
-
-        raw_current = (
-            await client.read_gatt_char(
-                CURRENT_UUID
+        if meta["protocol_version"] != 3:
+            raise RuntimeError(
+                "This program requires protocol v3. "
+                f"Sensor reports v"
+                f'{meta["protocol_version"]}.'
             )
-        )
 
-        current = parse_sample(
-            raw_current
-        )
-
-        print()
-        print("Current measurement")
-        print("-------------------")
-        print(
-            f'Sequence    : '
-            f'{current["sequence"]}'
-        )
-        print(
-            f'Temperature : '
-            f'{current["temperature"]:.2f} °C'
-        )
-        print(
-            f'Humidity    : '
-            f'{current["humidity"]:.2f} %'
-        )
-
-        # ----------------------------------------------------
-        # Current battery
-        # ----------------------------------------------------
-
-        raw_battery = (
-            await client.read_gatt_char(
-                BATTERY_CURRENT_UUID
+        if meta["sensor_id"] != SENSOR_ID:
+            raise RuntimeError(
+                f"Expected sensor ID {SENSOR_ID}; "
+                f"sensor reports "
+                f'{meta["sensor_id"]}.'
             )
-        )
-
-        battery = parse_battery(
-            raw_battery
-        )
-
-        percent = battery_percent(
-            battery["voltage"]
-        )
-
-        print()
-        print("Battery")
-        print("-------")
-        print(
-            f'Voltage     : '
-            f'{battery["voltage"]:.3f} V'
-        )
-        print(
-            f'Estimated   : '
-            f'{percent:.0f} %'
-        )
-        print(
-            f'Measured at : '
-            f'sequence #{battery["sequence"]}'
-        )
 
         # ----------------------------------------------------
-        # Download histories
+        # ENVIRONMENT STREAM
         # ----------------------------------------------------
 
-        environment = (
-            await download_history(
+        environment, env_time = (
+            await download_environment(
                 client,
                 meta["history_count"],
             )
         )
 
-        batteries = (
-            await download_battery_history(
+        # ----------------------------------------------------
+        # BATTERY STREAM
+        # ----------------------------------------------------
+
+        batteries, battery_time = (
+            await download_battery(
                 client,
                 meta["battery_count"],
             )
         )
 
+    # ========================================================
+    # DISCONNECTED
+    # ========================================================
+
     print()
     print("Disconnected.")
 
-    # --------------------------------------------------------
-    # Timestamps
-    # --------------------------------------------------------
+    # ========================================================
+    # SHOW NEWEST VALUES FROM STREAM
+    # ========================================================
+
+    if environment:
+
+        current = environment[-1]
+
+        print()
+        print("Newest environmental sample")
+        print("---------------------------")
+
+        print(
+            f'Sequence    : '
+            f'{current["sequence"]}'
+        )
+
+        print(
+            f'Temperature : '
+            f'{current["temperature"]:.2f} °C'
+        )
+
+        print(
+            f'Humidity    : '
+            f'{current["humidity"]:.2f} %'
+        )
+
+    if batteries:
+
+        current_battery = batteries[-1]
+
+        print()
+        print("Newest battery sample")
+        print("---------------------")
+
+        print(
+            f'Sequence : '
+            f'{current_battery["sequence"]}'
+        )
+
+        print(
+            f'Voltage  : '
+            f'{current_battery["voltage"]:.3f} V'
+        )
+
+        print(
+            f'Estimated: '
+            f'{battery_percent(current_battery["voltage"]):.0f} %'
+        )
+
+    # ========================================================
+    # PERFORMANCE
+    # ========================================================
+
+    print()
+    print("Transfer performance")
+    print("--------------------")
+
+    print(
+        f"Environment : "
+        f"{len(environment)} samples "
+        f"in {env_time:.3f} seconds"
+    )
+
+    print(
+        f"Battery     : "
+        f"{len(batteries)} samples "
+        f"in {battery_time:.3f} seconds"
+    )
+
+    # ========================================================
+    # TIMESTAMPS
+    # ========================================================
 
     add_timestamps(
         environment,
@@ -836,37 +842,23 @@ async def main():
         meta["sample_interval"],
     )
 
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
-
-    print()
-    print(
-        f"Received {len(environment)} "
-        f"environment samples."
-    )
-
-    print(
-        f"Received {len(batteries)} "
-        f"battery samples."
-    )
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
+    # ========================================================
+    # SAVE
+    # ========================================================
 
     save_environment_csv(
         environment
     )
 
     if batteries:
+
         save_battery_csv(
             batteries
         )
 
-    # --------------------------------------------------------
-    # Graph
-    # --------------------------------------------------------
+    # ========================================================
+    # GRAPH
+    # ========================================================
 
     show_graph(
         environment,
@@ -875,14 +867,16 @@ async def main():
 
 
 # ============================================================
-# START
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
 
     try:
 
-        asyncio.run(main())
+        asyncio.run(
+            main()
+        )
 
     except KeyboardInterrupt:
 
@@ -892,20 +886,14 @@ if __name__ == "__main__":
     except Exception as error:
 
         print()
-        print("ERROR:")
-        print(error)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
         print()
-        print("Stopped.")
-
-    except Exception as error:
-        print()
-        print("ERROR:")
-        print(f"Type    : {type(error).__name__}")
-        print(f"Details : {repr(error)}")
-        raise
+        print("ERROR")
+        print("-----")
+        print(
+            f"Type    : "
+            f"{type(error).__name__}"
+        )
+        print(
+            f"Details : "
+            f"{repr(error)}"
+        )

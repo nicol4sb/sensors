@@ -2,64 +2,66 @@
 #include <Wire.h>
 #include <Adafruit_SHT4x.h>
 #include <bluefruit.h>
-#include <Adafruit_TinyUSB.h>
 #include <math.h>
 
+#include "nrf_soc.h"
+
 // ============================================================
-// VMC BLE Environmental Sensor
+// VMC RED SENSOR - LOW POWER TEST
 //
-// Hardware:
-//   nRF52840 Pro Micro / nice!nano compatible
-//   SHT40 temperature + humidity sensor
-//   1S LiPo battery
+// Every 10 seconds:
+//   wake
+//   read SHT40
+//   read battery
+//   advertise for 1 second
+//   System-ON sleep
 //
-// Wiring:
-//   SHT40 VIN -> 3.3V
-//   SHT40 GND -> GND
-//   SHT40 SDA -> D2 / P0.17
-//   SHT40 SCL -> D3 / P0.20
+// No Serial
+// No LEDs
+// No history
+// No BLE connection
 //
-// Operation:
-//   - Read temperature, humidity and battery
-//   - Broadcast values using BLE manufacturer data
-//   - New measurement every 10 seconds
-//   - No BLE connection required
+// Once validated:
+//   - shorten advertising burst
+//   - change 10 seconds -> 10 minutes
 // ============================================================
 
+#define SENSOR_ID   2
+#define SENSOR_NAME "VMC-Sensor-Green"
 
-// ============================================================
-// SENSOR IDENTITY
-// ============================================================
-
-#define SENSOR_ID   1
-#define SENSOR_NAME "VMC-Sensor-Red"
+static const uint32_t MEASUREMENT_INTERVAL_MS = 10000UL;
 
 
 // ============================================================
-// TIMING
-// ============================================================
-
-// New measurement every 10 seconds
-
-static const uint32_t MEASUREMENT_INTERVAL_MS = 10000;
-
-
-// ============================================================
-// BLE
-// ============================================================
-
-// Manufacturer/company ID.
-//
-// We have already been using 0x0059 for the VMC project.
-
-static const uint16_t COMPANY_ID = 0x0059;
-
-
-// ============================================================
-// SHT40
+// SENSOR
 // ============================================================
 
 Adafruit_SHT4x sht4;
+
+
+// ============================================================
+// BLE PACKET
+//
+// Bleak receives 12 bytes as:
+//
+// manufacturer_data[0x0059]
+//
+// Python:
+// struct.unpack("<BBIhHH", data)
+// ============================================================
+
+struct __attribute__((packed)) SensorPacket
+{
+  uint8_t protocolVersion;
+  uint8_t sensorId;
+
+  uint32_t sequence;
+
+  int16_t temperature;
+  uint16_t humidity;
+
+  uint16_t batteryMillivolts;
+};
 
 
 // ============================================================
@@ -72,78 +74,7 @@ uint32_t lastMeasurement = 0;
 
 
 // ============================================================
-// BLE PACKET FORMAT
-// ============================================================
-//
-// Manufacturer data:
-//
-// Company ID:
-//     0x0059
-//
-// Payload:
-//
-// Byte 0
-//     Protocol version
-//
-// Byte 1
-//     Sensor ID
-//
-// Bytes 2-5
-//     Sequence number
-//     uint32 little endian
-//
-// Bytes 6-7
-//     Temperature × 100
-//     int16 little endian
-//
-// Bytes 8-9
-//     Relative humidity × 100
-//     uint16 little endian
-//
-// Bytes 10-11
-//     Battery voltage in millivolts
-//     uint16 little endian
-//
-// Example:
-//
-// Temperature:
-//     21.53 °C
-//
-// Stored:
-//     2153
-//
-// Humidity:
-//     47.82 %
-//
-// Stored:
-//     4782
-//
-// Battery:
-//     3.947 V
-//
-// Stored:
-//     3947
-//
-// ============================================================
-
-struct __attribute__((packed)) SensorPacket
-{
-  uint8_t protocolVersion;
-
-  uint8_t sensorId;
-
-  uint32_t sequence;
-
-  int16_t temperature;
-
-  uint16_t humidity;
-
-  uint16_t batteryMillivolts;
-};
-
-
-// ============================================================
-// READ BATTERY VOLTAGE
+// BATTERY
 // ============================================================
 
 uint16_t readBatteryMillivolts()
@@ -154,14 +85,8 @@ uint16_t readBatteryMillivolts()
       analogReadVDDHDIV5();
 
   float millivolts =
-      (
-        (float)raw
-        * 3600.0f
-        * 5.0f
-      )
+      ((float)raw * 3600.0f * 5.0f)
       / 4095.0f;
-
-  // Sanity limit in case something strange happens.
 
   if (millivolts > 6000.0f)
   {
@@ -175,24 +100,22 @@ uint16_t readBatteryMillivolts()
 
 
 // ============================================================
-// CREATE + BROADCAST MEASUREMENT
+// TAKE MEASUREMENT AND ADVERTISE
 // ============================================================
 
-void publishMeasurement()
+void takeMeasurementAndAdvertise()
 {
   // ----------------------------------------------------------
   // Read SHT40
   // ----------------------------------------------------------
 
   sensors_event_t humidityEvent;
-
   sensors_event_t temperatureEvent;
 
   sht4.getEvent(
       &humidityEvent,
       &temperatureEvent
   );
-
 
   float temperature =
       temperatureEvent.temperature;
@@ -202,7 +125,23 @@ void publishMeasurement()
 
 
   // ----------------------------------------------------------
-  // Read battery
+  // Invalid measurement?
+  //
+  // Don't waste radio energy sending garbage.
+  // ----------------------------------------------------------
+
+  if (
+      isnan(temperature)
+      ||
+      isnan(humidity)
+  )
+  {
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Battery
   // ----------------------------------------------------------
 
   uint16_t batteryMillivolts =
@@ -210,19 +149,20 @@ void publishMeasurement()
 
 
   // ----------------------------------------------------------
-  // Increment sequence
+  // Sequence
   // ----------------------------------------------------------
 
   sequenceNumber++;
 
 
   // ----------------------------------------------------------
-  // Build BLE packet
+  // Packet
   // ----------------------------------------------------------
 
   SensorPacket packet;
 
-  packet.protocolVersion = 1;
+  packet.protocolVersion =
+      1;
 
   packet.sensorId =
       SENSOR_ID;
@@ -232,14 +172,12 @@ void publishMeasurement()
 
   packet.temperature =
       (int16_t)roundf(
-          temperature
-          * 100.0f
+          temperature * 100.0f
       );
 
   packet.humidity =
       (uint16_t)roundf(
-          humidity
-          * 100.0f
+          humidity * 100.0f
       );
 
   packet.batteryMillivolts =
@@ -247,56 +185,60 @@ void publishMeasurement()
 
 
   // ----------------------------------------------------------
-  // Stop previous advertisement
+  // Manufacturer data
+  //
+  // 0x0059 = Bluetooth Company Identifier
+  //
+  // BLE sends:
+  //
+  // 59 00
+  // + our 12-byte packet
   // ----------------------------------------------------------
 
-  Bluefruit.Advertising.stop();
+  uint8_t manufacturerData[
+      2 + sizeof(SensorPacket)
+  ];
 
+  manufacturerData[0] =
+      0x59;
 
-  // ----------------------------------------------------------
-  // Clear old advertisement
-  // ----------------------------------------------------------
+  manufacturerData[1] =
+      0x00;
 
-  Bluefruit.Advertising.clearData();
-
-  Bluefruit.ScanResponse.clearData();
-
-
-  // ----------------------------------------------------------
-  // Standard BLE flags
-  // ----------------------------------------------------------
-
-  Bluefruit.Advertising.addFlags(
-      BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE
-  );
-
-
-  // ----------------------------------------------------------
-  // Add manufacturer packet
-  // ----------------------------------------------------------
-
-  Bluefruit.Advertising.addManufacturerData(
+  memcpy(
+      &manufacturerData[2],
       &packet,
       sizeof(packet)
   );
 
 
   // ----------------------------------------------------------
-  // Device name goes into scan response
+  // Previous advertising burst has already timed out.
+  //
+  // Do NOT call Advertising.stop().
   // ----------------------------------------------------------
 
-  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.clearData();
+
+
+  Bluefruit.Advertising.addFlags(
+      BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE
+  );
+
+
+  Bluefruit.Advertising.addManufacturerData(
+      manufacturerData,
+      sizeof(manufacturerData)
+  );
 
 
   // ----------------------------------------------------------
   // Advertising interval
   //
-  // BLE advertising interval unit = 0.625 ms
+  // 160 * 0.625 ms = 100 ms
   //
-  // 160 × 0.625 ms = 100 ms
-  //
-  // So while advertising, the nRF transmits approximately
-  // every 100 ms.
+  // About 10 advertising events during our 1-second
+  // diagnostic burst.
   // ----------------------------------------------------------
 
   Bluefruit.Advertising.setInterval(
@@ -306,22 +248,9 @@ void publishMeasurement()
 
 
   // ----------------------------------------------------------
-  // Fast advertising timeout
-  // ----------------------------------------------------------
-
-  Bluefruit.Advertising.setFastTimeout(
-      1
-  );
-
-
-  // ----------------------------------------------------------
-  // Advertise this measurement for 1 second.
+  // Advertise for 1 second.
   //
-  // During that second the same packet is transmitted several
-  // times.
-  //
-  // The Python receiver uses the sequence number to recognize
-  // duplicate packets.
+  // Bluefruit/SoftDevice handles radio operation.
   // ----------------------------------------------------------
 
   Bluefruit.Advertising.start(
@@ -337,7 +266,7 @@ void publishMeasurement()
 void setup()
 {
   // ----------------------------------------------------------
-  // Turn the onboard LED off
+  // LED OFF
   // ----------------------------------------------------------
 
   pinMode(
@@ -351,45 +280,38 @@ void setup()
 
 
   // ----------------------------------------------------------
-  // Start I2C
+  // I2C
   // ----------------------------------------------------------
 
   Wire.begin();
 
 
   // ----------------------------------------------------------
-  // Start SHT40
+  // SHT40
   // ----------------------------------------------------------
 
   if (!sht4.begin())
   {
-    // SHT40 wasn't found.
+    // Fatal sensor error.
     //
-    // Don't advertise bogus measurements.
-    // Stay here permanently.
+    // Sleep instead of spinning at full CPU power.
 
     while (true)
     {
-      ledOff(
-          LED_BUILTIN
-      );
-
-      vTaskDelay(
-          pdMS_TO_TICKS(1000)
-      );
+      sd_app_evt_wait();
     }
   }
 
 
-  // Medium precision is more than adequate for room
-  // temperature/humidity monitoring and saves some energy.
+  // Medium precision:
+  // plenty for room monitoring.
 
   sht4.setPrecision(
       SHT4X_MED_PRECISION
   );
 
 
-  // Heater disabled.
+  // Heater OFF.
 
   sht4.setHeater(
       SHT4X_NO_HEATER
@@ -397,7 +319,7 @@ void setup()
 
 
   // ----------------------------------------------------------
-  // Start Bluetooth
+  // BLUEFRUIT
   // ----------------------------------------------------------
 
   Bluefruit.begin(
@@ -406,14 +328,12 @@ void setup()
   );
 
 
-  // Don't let Bluefruit use the onboard LED.
+  // No automatic status LED.
 
   Bluefruit.autoConnLed(
       false
   );
 
-
-  // Explicitly ensure LED remains off.
 
   pinMode(
       LED_BUILTIN,
@@ -426,7 +346,7 @@ void setup()
 
 
   // ----------------------------------------------------------
-  // BLE device name
+  // BLE identity
   // ----------------------------------------------------------
 
   Bluefruit.setName(
@@ -435,14 +355,13 @@ void setup()
 
 
   // ----------------------------------------------------------
-  // Transmit power
+  // TX power
   //
-  // 0 dBm is a reasonable starting point for indoor use.
+  // 0 dBm is a sensible starting point.
   //
-  // If range is poor we can later try +4 dBm.
-  //
-  // If range is excellent and battery life matters, we can
-  // later try -4 dBm.
+  // Later:
+  //   test -4 dBm
+  //   test -8 dBm
   // ----------------------------------------------------------
 
   Bluefruit.setTxPower(
@@ -451,10 +370,22 @@ void setup()
 
 
   // ----------------------------------------------------------
+  // Scan response
+  //
+  // Configure name once.
+  // ----------------------------------------------------------
+
+  Bluefruit.ScanResponse.clearData();
+
+
+  Bluefruit.ScanResponse.addName();
+
+
+  // ----------------------------------------------------------
   // First measurement immediately
   // ----------------------------------------------------------
 
-  publishMeasurement();
+  takeMeasurementAndAdvertise();
 
 
   lastMeasurement =
@@ -463,7 +394,7 @@ void setup()
 
 
 // ============================================================
-// MAIN LOOP
+// LOOP
 // ============================================================
 
 void loop()
@@ -473,19 +404,12 @@ void loop()
 
 
   // ----------------------------------------------------------
-  // Every 10 seconds:
-  //
-  //     SHT40
-  //       +
-  //     battery
-  //       ↓
-  //     BLE advertisement
+  // Is it time for another measurement?
   // ----------------------------------------------------------
 
   if (
       (uint32_t)(
-          now
-          - lastMeasurement
+          now - lastMeasurement
       )
       >= MEASUREMENT_INTERVAL_MS
   )
@@ -493,19 +417,25 @@ void loop()
     lastMeasurement =
         now;
 
-    publishMeasurement();
+
+    takeMeasurementAndAdvertise();
   }
 
 
   // ----------------------------------------------------------
-  // Yield to FreeRTOS / SoftDevice.
+  // SYSTEM-ON LOW POWER SLEEP
   //
-  // We deliberately use vTaskDelay rather than the ordinary
-  // delay() here because this behaved reliably on these
-  // particular nRF52840 boards with the Adafruit core.
+  // CPU stops executing here.
+  //
+  // It wakes when the SoftDevice / timer / interrupt has
+  // something to process.
+  //
+  // RAM retained.
+  // RTC/timing retained.
+  // BLE remains functional.
+  //
+  // This is NOT a busy wait.
   // ----------------------------------------------------------
 
-  vTaskDelay(
-      pdMS_TO_TICKS(10)
-  );
+  sd_app_evt_wait();
 }
