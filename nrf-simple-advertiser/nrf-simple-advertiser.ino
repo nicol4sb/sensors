@@ -10,9 +10,9 @@
 // ============================================================
 // VMC SENSOR - LOW POWER TEST
 //
-// SAME SKETCH FOR ALL SENSORS.
+// SAME CODE FOR ALL 3 SENSORS.
 //
-// Change ONLY SENSOR_ID before flashing:
+// Change ONLY SENSOR_ID:
 //
 //   1 = Red
 //   2 = Green
@@ -21,7 +21,7 @@
 // Every 10 seconds:
 //   wake
 //   read SHT40
-//   apply sensor calibration
+//   apply calibration offsets
 //   read battery
 //   advertise for 1 second
 //   System-ON sleep
@@ -32,7 +32,6 @@
 // No BLE connection
 //
 // Once validated:
-//   - shorten advertising burst
 //   - change 10 seconds -> 10 minutes
 // ============================================================
 
@@ -40,55 +39,40 @@
 // ============================================================
 // SENSOR ID
 //
-// THIS IS THE ONLY VALUE TO CHANGE BETWEEN BOARDS.
+// CHANGE ONLY THIS VALUE FOR EACH SENSOR:
 //
-// 1 = Red
-// 2 = Green
-// 3 = Sensor 3
+//   1 = Red
+//   2 = Green
+//   3 = Sensor 3
 // ============================================================
 
 #define SENSOR_ID 1
 
 
-static const uint32_t MEASUREMENT_INTERVAL_MS = 600000UL;
+static const uint32_t MEASUREMENT_INTERVAL_MS = 60000UL;
 
 
 // ============================================================
-// SENSOR CONFIGURATION / CALIBRATION
+// SENSOR CONFIGURATION
 //
-// Calibration is relative calibration between our sensors.
+// Calibration offsets:
 //
-// Current reference = midpoint between Red and Green:
+// Red:
+//   Temperature: +0.285 C
+//   Humidity:    -0.515 %RH
 //
-// Temperature:
-//   Red   25.85 C
-//   Green 26.42 C
-//   midpoint 26.135 C
+// Green:
+//   Temperature: -0.285 C
+//   Humidity:    +0.515 %RH
 //
-// Humidity:
-//   Red   40.41 %
-//   Green 39.38 %
-//   midpoint 39.895 %
-//
-// Therefore:
-//
-//   Red:
-//     temperature +0.285 C
-//     humidity    -0.515 %RH
-//
-//   Green:
-//     temperature -0.285 C
-//     humidity    +0.515 %RH
-//
-// Sensor 3 is uncalibrated for now.
+// Sensor 3:
+//   Not calibrated yet
 // ============================================================
 
 struct SensorConfig
 {
   uint8_t id;
-
   const char* name;
-
   float temperatureOffset;
   float humidityOffset;
 };
@@ -99,15 +83,15 @@ static const SensorConfig SENSOR_CONFIGS[] =
   {
     1,
     "VMC-Sensor-Red",
-    +0.285f,
-    -0.515f
+    +0.0f,
+    -0.0f
   },
 
   {
     2,
     "VMC-Sensor-Green",
-    -0.285f,
-    +0.515f
+    -0.0f,
+    +0.0f
   },
 
   {
@@ -125,7 +109,14 @@ static const size_t SENSOR_CONFIG_COUNT =
 
 
 // ============================================================
-// GET CONFIGURATION FOR THIS SENSOR
+// ACTIVE SENSOR CONFIGURATION
+// ============================================================
+
+const SensorConfig* sensorConfig = nullptr;
+
+
+// ============================================================
+// FIND SENSOR CONFIGURATION
 // ============================================================
 
 const SensorConfig* getSensorConfig()
@@ -140,13 +131,6 @@ const SensorConfig* getSensorConfig()
 
   return nullptr;
 }
-
-
-// ============================================================
-// ACTIVE SENSOR CONFIGURATION
-// ============================================================
-
-const SensorConfig* sensorConfig = nullptr;
 
 
 // ============================================================
@@ -259,11 +243,7 @@ void takeMeasurementAndAdvertise()
 
 
   // ----------------------------------------------------------
-  // Apply per-sensor calibration
-  //
-  // The corrected values are what get transmitted over BLE.
-  // The Raspberry Pi / Python collector therefore does not
-  // need to know anything about calibration.
+  // Apply calibration offsets
   // ----------------------------------------------------------
 
   temperature +=
@@ -274,7 +254,7 @@ void takeMeasurementAndAdvertise()
 
 
   // ----------------------------------------------------------
-  // Keep humidity inside its physically valid range.
+  // Clamp humidity to physical range
   // ----------------------------------------------------------
 
   if (humidity < 0.0f)
@@ -437,15 +417,15 @@ void setup()
 
 
   // ----------------------------------------------------------
-  // Find configuration for this SENSOR_ID.
-  //
-  // If the ID does not exist in SENSOR_CONFIGS, sleep forever.
-  // This prevents accidentally transmitting with an undefined
-  // calibration or name.
+  // Get configuration for this SENSOR_ID
   // ----------------------------------------------------------
 
   sensorConfig =
       getSensorConfig();
+
+
+  // Invalid SENSOR_ID:
+  // sleep forever instead of running with bad configuration.
 
   if (sensorConfig == nullptr)
   {
@@ -525,7 +505,7 @@ void setup()
   // ----------------------------------------------------------
   // BLE identity
   //
-  // Name comes automatically from the configuration table.
+  // Name selected automatically from SENSOR_ID.
   // ----------------------------------------------------------
 
   Bluefruit.setName(
@@ -536,11 +516,7 @@ void setup()
   // ----------------------------------------------------------
   // TX power
   //
-  // 0 dBm is a sensible starting point.
-  //
-  // Later:
-  //   test -4 dBm
-  //   test -8 dBm
+  // +4 dBm for better reception margin.
   // ----------------------------------------------------------
 
   Bluefruit.setTxPower(
