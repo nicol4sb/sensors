@@ -6,12 +6,22 @@
 
 #include "nrf_soc.h"
 
+
 // ============================================================
-// VMC RED SENSOR - LOW POWER TEST
+// VMC SENSOR - LOW POWER TEST
+//
+// SAME SKETCH FOR ALL SENSORS.
+//
+// Change ONLY SENSOR_ID before flashing:
+//
+//   1 = Red
+//   2 = Green
+//   3 = Sensor 3
 //
 // Every 10 seconds:
 //   wake
 //   read SHT40
+//   apply sensor calibration
 //   read battery
 //   advertise for 1 second
 //   System-ON sleep
@@ -26,10 +36,117 @@
 //   - change 10 seconds -> 10 minutes
 // ============================================================
 
-#define SENSOR_ID   2
-#define SENSOR_NAME "VMC-Sensor-Green"
 
-static const uint32_t MEASUREMENT_INTERVAL_MS = 10000UL;
+// ============================================================
+// SENSOR ID
+//
+// THIS IS THE ONLY VALUE TO CHANGE BETWEEN BOARDS.
+//
+// 1 = Red
+// 2 = Green
+// 3 = Sensor 3
+// ============================================================
+
+#define SENSOR_ID 1
+
+
+static const uint32_t MEASUREMENT_INTERVAL_MS = 600000UL;
+
+
+// ============================================================
+// SENSOR CONFIGURATION / CALIBRATION
+//
+// Calibration is relative calibration between our sensors.
+//
+// Current reference = midpoint between Red and Green:
+//
+// Temperature:
+//   Red   25.85 C
+//   Green 26.42 C
+//   midpoint 26.135 C
+//
+// Humidity:
+//   Red   40.41 %
+//   Green 39.38 %
+//   midpoint 39.895 %
+//
+// Therefore:
+//
+//   Red:
+//     temperature +0.285 C
+//     humidity    -0.515 %RH
+//
+//   Green:
+//     temperature -0.285 C
+//     humidity    +0.515 %RH
+//
+// Sensor 3 is uncalibrated for now.
+// ============================================================
+
+struct SensorConfig
+{
+  uint8_t id;
+
+  const char* name;
+
+  float temperatureOffset;
+  float humidityOffset;
+};
+
+
+static const SensorConfig SENSOR_CONFIGS[] =
+{
+  {
+    1,
+    "VMC-Sensor-Red",
+    +0.285f,
+    -0.515f
+  },
+
+  {
+    2,
+    "VMC-Sensor-Green",
+    -0.285f,
+    +0.515f
+  },
+
+  {
+    3,
+    "VMC-Sensor-3",
+    0.000f,
+    0.000f
+  }
+};
+
+
+static const size_t SENSOR_CONFIG_COUNT =
+    sizeof(SENSOR_CONFIGS)
+    / sizeof(SENSOR_CONFIGS[0]);
+
+
+// ============================================================
+// GET CONFIGURATION FOR THIS SENSOR
+// ============================================================
+
+const SensorConfig* getSensorConfig()
+{
+  for (size_t i = 0; i < SENSOR_CONFIG_COUNT; i++)
+  {
+    if (SENSOR_CONFIGS[i].id == SENSOR_ID)
+    {
+      return &SENSOR_CONFIGS[i];
+    }
+  }
+
+  return nullptr;
+}
+
+
+// ============================================================
+// ACTIVE SENSOR CONFIGURATION
+// ============================================================
+
+const SensorConfig* sensorConfig = nullptr;
 
 
 // ============================================================
@@ -117,6 +234,7 @@ void takeMeasurementAndAdvertise()
       &temperatureEvent
   );
 
+
   float temperature =
       temperatureEvent.temperature;
 
@@ -141,6 +259,36 @@ void takeMeasurementAndAdvertise()
 
 
   // ----------------------------------------------------------
+  // Apply per-sensor calibration
+  //
+  // The corrected values are what get transmitted over BLE.
+  // The Raspberry Pi / Python collector therefore does not
+  // need to know anything about calibration.
+  // ----------------------------------------------------------
+
+  temperature +=
+      sensorConfig->temperatureOffset;
+
+  humidity +=
+      sensorConfig->humidityOffset;
+
+
+  // ----------------------------------------------------------
+  // Keep humidity inside its physically valid range.
+  // ----------------------------------------------------------
+
+  if (humidity < 0.0f)
+  {
+    humidity = 0.0f;
+  }
+
+  if (humidity > 100.0f)
+  {
+    humidity = 100.0f;
+  }
+
+
+  // ----------------------------------------------------------
   // Battery
   // ----------------------------------------------------------
 
@@ -161,24 +309,30 @@ void takeMeasurementAndAdvertise()
 
   SensorPacket packet;
 
+
   packet.protocolVersion =
       1;
+
 
   packet.sensorId =
       SENSOR_ID;
 
+
   packet.sequence =
       sequenceNumber;
+
 
   packet.temperature =
       (int16_t)roundf(
           temperature * 100.0f
       );
 
+
   packet.humidity =
       (uint16_t)roundf(
           humidity * 100.0f
       );
+
 
   packet.batteryMillivolts =
       batteryMillivolts;
@@ -199,11 +353,14 @@ void takeMeasurementAndAdvertise()
       2 + sizeof(SensorPacket)
   ];
 
+
   manufacturerData[0] =
       0x59;
 
+
   manufacturerData[1] =
       0x00;
+
 
   memcpy(
       &manufacturerData[2],
@@ -280,6 +437,26 @@ void setup()
 
 
   // ----------------------------------------------------------
+  // Find configuration for this SENSOR_ID.
+  //
+  // If the ID does not exist in SENSOR_CONFIGS, sleep forever.
+  // This prevents accidentally transmitting with an undefined
+  // calibration or name.
+  // ----------------------------------------------------------
+
+  sensorConfig =
+      getSensorConfig();
+
+  if (sensorConfig == nullptr)
+  {
+    while (true)
+    {
+      sd_app_evt_wait();
+    }
+  }
+
+
+  // ----------------------------------------------------------
   // I2C
   // ----------------------------------------------------------
 
@@ -347,10 +524,12 @@ void setup()
 
   // ----------------------------------------------------------
   // BLE identity
+  //
+  // Name comes automatically from the configuration table.
   // ----------------------------------------------------------
 
   Bluefruit.setName(
-      SENSOR_NAME
+      sensorConfig->name
   );
 
 
@@ -365,7 +544,7 @@ void setup()
   // ----------------------------------------------------------
 
   Bluefruit.setTxPower(
-      0
+      4
   );
 
 
