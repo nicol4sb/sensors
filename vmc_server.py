@@ -35,7 +35,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 COMPANY_ID = 0x0059
 
-DATA_DIR = "vmc_data"
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vmc_data")
 
 
 
@@ -5089,7 +5089,47 @@ const desktopInspectorPlugin = {
 
 
 
-function chartOptions(type) {
+function alignedTimeTicks(scale) {
+    const minute = 60000;
+    const span = scale.max - scale.min;
+    const target = window.innerWidth <= 700 ? 5 : 9;
+    const intervals = [10, 20, 30, 60, 120, 180, 360, 720, 1440, 2880, 10080];
+    const spacing = intervals.find(value => span / (value * minute) <= target) || 10080;
+    const ticks = [];
+    if (spacing >= 1440) {
+        const date = new Date(scale.min);
+        date.setHours(0, 0, 0, 0);
+        if (date.getTime() < scale.min) date.setDate(date.getDate() + 1);
+        while (date.getTime() <= scale.max) {
+            ticks.push({ value: date.getTime() });
+            date.setDate(date.getDate() + spacing / 1440);
+        }
+    } else {
+        const step = spacing * minute;
+        const offset = new Date(scale.min).getTimezoneOffset() * minute;
+        let value = Math.ceil((scale.min - offset) / step) * step + offset;
+        for (; value <= scale.max; value += step) ticks.push({ value });
+    }
+    scale.ticks = ticks;
+}
+
+function chartOptions(type, datasets) {
+    const now = Date.now();
+    let first = Infinity;
+    let last = -Infinity;
+    for (const dataset of datasets) {
+        for (const point of dataset.data) {
+            if (Number.isFinite(point.x)) {
+                first = Math.min(first, point.x);
+                last = Math.max(last, point.x);
+            }
+        }
+    }
+    const axisEnd = historyHours === "all" && Number.isFinite(last) ? last : now;
+    const axisStart = historyHours === "all"
+        ? (Number.isFinite(first) ? Math.min(first, axisEnd - 600000) : axisEnd - 86400000)
+        : axisEnd - Number(historyHours) * 3600000;
+
 
 
 
@@ -5336,6 +5376,10 @@ function chartOptions(type) {
                 type:
 
                     "linear",
+                min: axisStart,
+                max: axisEnd,
+                afterBuildTicks: alignedTimeTicks,
+
 
 
 
@@ -5685,7 +5729,7 @@ function createChart(
 
                 options:
 
-                    chartOptions(type),
+                    chartOptions(type, datasets),
 
 
 
@@ -6642,11 +6686,33 @@ def api_history():
 
 
 
+def restore_latest_data():
+    """Restore sensor cards from the most recent saved CSV measurements."""
+    history = read_history()
+    with data_lock:
+        for sensor_id, sensor in SENSORS.items():
+            points = history[str(sensor_id)]["points"]
+            if not points:
+                continue
+            packet = dict(points[-1])
+            voltage = packet["battery_mv"] / 1000.0
+            packet.update(
+                sensor_id=sensor_id,
+                protocol=1,
+                name=sensor["name"],
+                color=sensor["color"],
+                battery_voltage=voltage,
+                battery_percent=battery_percent(voltage),
+            )
+            latest_data[sensor_id] = packet
+
+
 if __name__ == "__main__":
 
 
 
     ensure_data_directory()
+    restore_latest_data()
 
 
 

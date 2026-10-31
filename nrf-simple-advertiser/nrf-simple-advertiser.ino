@@ -18,12 +18,11 @@
 //   2 = Green
 //   3 = Sensor 3
 //
-// Every 10 seconds:
+// Every 10 minutes:
 //   wake
 //   read SHT40
-//   apply calibration offsets
 //   read battery
-//   advertise for 1 second
+//   advertise for 2 seconds
 //   System-ON sleep
 //
 // No Serial
@@ -31,8 +30,7 @@
 // No history
 // No BLE connection
 //
-// Once validated:
-//   - change 10 seconds -> 10 minutes
+// Production interval: 10 minutes.
 // ============================================================
 
 
@@ -46,91 +44,15 @@
 //   3 = Sensor 3
 // ============================================================
 
-#define SENSOR_ID 1
+#define SENSOR_ID 2
+
+#if SENSOR_ID < 1 || SENSOR_ID > 3
+#error "SENSOR_ID must be 1, 2, or 3"
+#endif
 
 
-static const uint32_t MEASUREMENT_INTERVAL_MS = 60000UL;
+static const uint32_t MEASUREMENT_INTERVAL_MS = 600000UL;
 
-
-// ============================================================
-// SENSOR CONFIGURATION
-//
-// Calibration offsets:
-//
-// Red:
-//   Temperature: +0.285 C
-//   Humidity:    -0.515 %RH
-//
-// Green:
-//   Temperature: -0.285 C
-//   Humidity:    +0.515 %RH
-//
-// Sensor 3:
-//   Not calibrated yet
-// ============================================================
-
-struct SensorConfig
-{
-  uint8_t id;
-  const char* name;
-  float temperatureOffset;
-  float humidityOffset;
-};
-
-
-static const SensorConfig SENSOR_CONFIGS[] =
-{
-  {
-    1,
-    "VMC-Sensor-Red",
-    +0.0f,
-    -0.0f
-  },
-
-  {
-    2,
-    "VMC-Sensor-Green",
-    -0.0f,
-    +0.0f
-  },
-
-  {
-    3,
-    "VMC-Sensor-3",
-    0.000f,
-    0.000f
-  }
-};
-
-
-static const size_t SENSOR_CONFIG_COUNT =
-    sizeof(SENSOR_CONFIGS)
-    / sizeof(SENSOR_CONFIGS[0]);
-
-
-// ============================================================
-// ACTIVE SENSOR CONFIGURATION
-// ============================================================
-
-const SensorConfig* sensorConfig = nullptr;
-
-
-// ============================================================
-// FIND SENSOR CONFIGURATION
-// ============================================================
-
-const SensorConfig* getSensorConfig()
-{
-  for (size_t i = 0; i < SENSOR_CONFIG_COUNT; i++)
-  {
-    if (SENSOR_CONFIGS[i].id == SENSOR_ID)
-    {
-      return &SENSOR_CONFIGS[i];
-    }
-  }
-
-  return nullptr;
-}
 
 
 // ============================================================
@@ -171,7 +93,6 @@ struct __attribute__((packed)) SensorPacket
 
 uint32_t sequenceNumber = 0;
 
-uint32_t lastMeasurement = 0;
 
 
 // ============================================================
@@ -213,10 +134,13 @@ void takeMeasurementAndAdvertise()
   sensors_event_t humidityEvent;
   sensors_event_t temperatureEvent;
 
-  sht4.getEvent(
-      &humidityEvent,
-      &temperatureEvent
-  );
+  if (!sht4.getEvent(
+          &humidityEvent,
+          &temperatureEvent
+      ))
+  {
+    return;
+  }
 
 
   float temperature =
@@ -241,16 +165,6 @@ void takeMeasurementAndAdvertise()
     return;
   }
 
-
-  // ----------------------------------------------------------
-  // Apply calibration offsets
-  // ----------------------------------------------------------
-
-  temperature +=
-      sensorConfig->temperatureOffset;
-
-  humidity +=
-      sensorConfig->humidityOffset;
 
 
   // ----------------------------------------------------------
@@ -292,7 +206,6 @@ void takeMeasurementAndAdvertise()
 
   packet.protocolVersion =
       1;
-
 
   packet.sensorId =
       SENSOR_ID;
@@ -351,8 +264,6 @@ void takeMeasurementAndAdvertise()
 
   // ----------------------------------------------------------
   // Previous advertising burst has already timed out.
-  //
-  // Do NOT call Advertising.stop().
   // ----------------------------------------------------------
 
   Bluefruit.Advertising.clearData();
@@ -374,7 +285,7 @@ void takeMeasurementAndAdvertise()
   //
   // 160 * 0.625 ms = 100 ms
   //
-  // About 10 advertising events during our 1-second
+  // About 20 advertising events during our 2-second
   // diagnostic burst.
   // ----------------------------------------------------------
 
@@ -385,13 +296,14 @@ void takeMeasurementAndAdvertise()
 
 
   // ----------------------------------------------------------
-  // Advertise for 1 second.
+  // Advertise for 2 seconds. The fast timeout is also configured
+  // as 2 seconds in setup so it cannot exceed this total timeout.
   //
   // Bluefruit/SoftDevice handles radio operation.
   // ----------------------------------------------------------
 
   Bluefruit.Advertising.start(
-      1
+      2
   );
 }
 
@@ -416,24 +328,6 @@ void setup()
   );
 
 
-  // ----------------------------------------------------------
-  // Get configuration for this SENSOR_ID
-  // ----------------------------------------------------------
-
-  sensorConfig =
-      getSensorConfig();
-
-
-  // Invalid SENSOR_ID:
-  // sleep forever instead of running with bad configuration.
-
-  if (sensorConfig == nullptr)
-  {
-    while (true)
-    {
-      sd_app_evt_wait();
-    }
-  }
 
 
   // ----------------------------------------------------------
@@ -492,48 +386,34 @@ void setup()
   );
 
 
-  pinMode(
-      LED_BUILTIN,
-      OUTPUT
+  // Manufacturer data does not need a scan response. Using
+  // non-connectable, non-scannable advertising minimizes radio
+  // work and prevents connection attempts.
+
+  Bluefruit.Advertising.setType(
+      BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED
   );
 
-  ledOff(
-      LED_BUILTIN
+
+  // Keep a two-second total timeout from inheriting Bluefruit's
+  // default 30-second fast-advertising phase.
+
+  Bluefruit.Advertising.setFastTimeout(
+      2
   );
 
-
-  // ----------------------------------------------------------
-  // BLE identity
-  //
-  // Name selected automatically from SENSOR_ID.
-  // ----------------------------------------------------------
-
-  Bluefruit.setName(
-      sensorConfig->name
-  );
 
 
   // ----------------------------------------------------------
   // TX power
   //
-  // +4 dBm for better reception margin.
+  // +8 dBm for better reception margin.
   // ----------------------------------------------------------
 
   Bluefruit.setTxPower(
-      4
+      8
   );
 
-
-  // ----------------------------------------------------------
-  // Scan response
-  //
-  // Configure name once.
-  // ----------------------------------------------------------
-
-  Bluefruit.ScanResponse.clearData();
-
-
-  Bluefruit.ScanResponse.addName();
 
 
   // ----------------------------------------------------------
@@ -542,9 +422,6 @@ void setup()
 
   takeMeasurementAndAdvertise();
 
-
-  lastMeasurement =
-      millis();
 }
 
 
@@ -554,43 +431,12 @@ void setup()
 
 void loop()
 {
-  uint32_t now =
-      millis();
 
 
-  // ----------------------------------------------------------
-  // Is it time for another measurement?
-  // ----------------------------------------------------------
+  // Block this task so the RTOS idle task can enter its low-power
+  // state while BLE continues asynchronously.
 
-  if (
-      (uint32_t)(
-          now - lastMeasurement
-      )
-      >= MEASUREMENT_INTERVAL_MS
-  )
-  {
-    lastMeasurement =
-        now;
+  delay(MEASUREMENT_INTERVAL_MS);
 
-
-    takeMeasurementAndAdvertise();
-  }
-
-
-  // ----------------------------------------------------------
-  // SYSTEM-ON LOW POWER SLEEP
-  //
-  // CPU stops executing here.
-  //
-  // It wakes when the SoftDevice / timer / interrupt has
-  // something to process.
-  //
-  // RAM retained.
-  // RTC/timing retained.
-  // BLE remains functional.
-  //
-  // This is NOT a busy wait.
-  // ----------------------------------------------------------
-
-  sd_app_evt_wait();
+  takeMeasurementAndAdvertise();
 }
