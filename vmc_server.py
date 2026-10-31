@@ -4105,7 +4105,7 @@ function makeDataset(
 
         pointRadius:
 
-            0,
+            points.length === 1 ? 3 : 0,
 
 
 
@@ -6544,7 +6544,7 @@ setInterval(
 
     updateSensors,
 
-    1000
+    10000
 
 );
 
@@ -6568,7 +6568,7 @@ setInterval(
 
     updateHistory,
 
-    5000
+    60000
 
 );
 
