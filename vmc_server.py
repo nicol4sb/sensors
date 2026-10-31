@@ -35,7 +35,13 @@ from flask import Flask, jsonify, render_template_string, request
 
 COMPANY_ID = 0x0059
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vmc_data")
+# Persist beside the script by default, independent of the launch directory.
+# Deployments may point at an existing data directory with VMC_DATA_DIR.
+_data_dir_override = os.environ.get("VMC_DATA_DIR", "").strip()
+DATA_DIR = os.path.expanduser(_data_dir_override) if _data_dir_override else "vmc_data"
+if not os.path.isabs(DATA_DIR):
+    DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_DIR)
+DATA_DIR = os.path.abspath(DATA_DIR)
 
 
 
