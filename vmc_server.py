@@ -2277,369 +2277,99 @@ body {
 
 
 
-/* ==========================================================
+/* Mobile-first viewport layout: reserve chrome, share all remaining space. */
+html, body {
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+}
+.dashboard {
+    max-width: none;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    padding: max(6px, env(safe-area-inset-top))
+             max(8px, env(safe-area-inset-right))
+             max(6px, env(safe-area-inset-bottom))
+             max(8px, env(safe-area-inset-left));
+    gap: 6px;
+}
+.dashboard > *, .chart-card, .chart-container {
+    min-width: 0;
+    min-height: 0;
+}
+.header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+}
+.title-area { gap: 8px; }
+.title { font-size: 18px; }
+.logo { width: 30px; height: 30px; }
+.history-controls { width: 100%; }
+.history-controls button { flex: 1; min-width: 0; padding: 6px 4px; }
+.sensor-grid { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+.sensor-card { padding: 7px 10px; }
+.sensor-top { margin-bottom: 5px; }
+.main-values { margin-bottom: 5px; gap: 8px; }
+.value-number { font-size: clamp(21px, 5vw, 29px); }
+.value-label { margin-top: 3px; }
+.sensor-bottom { padding-top: 5px; gap: 6px; flex-wrap: wrap; }
+.sensor-indicators { gap: 10px; flex-wrap: wrap; }
+.last-seen { margin-left: auto; }
+.charts {
+    flex: 1 1 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+}
+.chart-card { height: auto; margin: 0; padding: 6px 8px 4px; }
+.chart-container { flex: 1 1 0; }
+.chart-container canvas {
+    position: absolute;
+    inset: 0;
+    width: 100% !important;
+    height: 100% !important;
+}
+.footer { justify-content: center; font-size: 8px; }
 
-   Compact laptop screens
+@media (min-width: 701px) {
+    .dashboard { padding: 12px 16px; gap: 10px; }
+    .header { flex-direction: row; align-items: center; gap: 16px; }
+    .title { font-size: 20px; }
+    .history-controls { width: auto; }
+    .history-controls button { min-width: 43px; }
+    .sensor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .sensor-card { padding: 10px 13px; }
+    .value-number { font-size: clamp(25px, 2.2vw, 34px); }
+    .charts { gap: 10px; }
+    .chart-card { padding: 10px 13px 8px; }
+    .footer { justify-content: flex-end; }
+}
 
-   ========================================================== */
-
-
-
-@media (
-
-    min-width: 701px
-
-)
-
-and (
-
-    max-height: 800px
-
-) {
-
-
-
-    .dashboard {
-
-        padding-top: 9px;
-
-        padding-bottom: 7px;
-
-
-
-        gap: 7px;
-
-    }
-
-
-
-    .sensor-card {
-
-        padding-top: 9px;
-
-        padding-bottom: 9px;
-
-    }
-
-
-
-    .sensor-top {
-
-        margin-bottom: 7px;
-
-    }
-
-
-
-    .main-values {
-
-        margin-bottom: 8px;
-
-    }
-
-
-
-    .value-number {
-
-        font-size: 25px;
-
-    }
-
-
-
-    .sensor-bottom {
-
-        padding-top: 7px;
-
-    }
-
-
-
+/* Landscape phones and short windows keep both plots usable side by side. */
+@media (max-height: 540px) {
+    .dashboard { padding-top: 4px; padding-bottom: 4px; gap: 4px; }
+    .header { flex-direction: row; align-items: center; gap: 6px; }
+    .title { font-size: 14px; }
+    .subtitle, .logo { display: none; }
+    .history-controls { width: auto; flex: 1; max-width: 280px; }
+    .history-controls button { min-width: 0; padding: 5px 3px; }
+    .sensor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+    .sensor-card { padding: 5px 7px; }
+    .sensor-name { font-size: 10px; }
+    .value-number { font-size: 20px; }
+    .value-unit { font-size: 11px; }
+    .sensor-top, .main-values { margin-bottom: 3px; }
+    .sensor-bottom { padding-top: 3px; }
     .charts {
-
-        gap: 7px;
-
-
-
-        grid-template-rows:
-
-            repeat(
-
-                2,
-
-                minmax(165px, 1fr)
-
-            );
-
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-rows: minmax(0, 1fr);
+        gap: 4px;
     }
-
-
-
+    .chart-card { padding: 5px 6px 3px; }
 }
-
-
-
-
-
-/* ==========================================================
-
-   Mobile
-
-   ========================================================== */
-
-
-
-@media (
-
-    max-width: 700px
-
-) {
-
-
-
-    .dashboard {
-
-        min-height: auto;
-
-
-
-        padding: 12px 10px 18px;
-
-
-
-        gap: 10px;
-
-    }
-
-
-
-
-
-    .header {
-
-        align-items: flex-start;
-
-
-
-        flex-direction: column;
-
-
-
-        gap: 10px;
-
-    }
-
-
-
-
-
-    .history-controls {
-
-        width: 100%;
-
-    }
-
-
-
-
-
-    .history-controls button {
-
-        flex: 1;
-
-
-
-        min-width: 0;
-
-
-
-        padding: 8px 4px;
-
-
-
-        font-size: 11px;
-
-    }
-
-
-
-
-
-    .sensor-grid {
-
-        grid-template-columns: 1fr;
-
-    }
-
-
-
-
-
-    .sensor-card {
-
-        padding: 13px 14px;
-
-    }
-
-
-
-
-
-    .value-number {
-
-        font-size: 29px;
-
-    }
-
-
-
-
-
-    .sensor-bottom {
-
-        align-items: flex-start;
-
-
-
-        flex-direction: column;
-
-
-
-        gap: 8px;
-
-    }
-
-
-
-
-
-    .sensor-indicators {
-
-        width: 100%;
-
-
-
-        justify-content: space-between;
-
-    }
-
-
-
-
-
-    .last-seen {
-
-        width: 100%;
-
-
-
-        text-align: right;
-
-    }
-
-
-
-
-
-    .charts {
-
-        display: block;
-
-    }
-
-
-
-
-
-    .chart-card {
-
-        height: 265px;
-
-
-
-        margin-bottom: 10px;
-
-    }
-
-
-
-
-
-    .footer {
-
-        justify-content: center;
-
-
-
-        padding-top: 2px;
-
-    }
-
-
-
-}
-
-
-
-
-
-/* ==========================================================
-
-   Very narrow phone
-
-   ========================================================== */
-
-
-
-@media (
-
-    max-width: 380px
-
-) {
-
-
-
-    .value-number {
-
-        font-size: 25px;
-
-    }
-
-
-
-
-
-    .sensor-indicators {
-
-        gap: 10px;
-
-    }
-
-
-
-
-
-    .battery-values {
-
-        gap: 3px;
-
-    }
-
-
-
-
-
-    .chart-card {
-
-        height: 235px;
-
-    }
-
-
-
-}
-
-
 
 </style>
 
