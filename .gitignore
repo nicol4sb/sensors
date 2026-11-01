@@ -1,2 +1,3 @@
 libraries/
 *.csv
+vmc_data/.history-cache-*

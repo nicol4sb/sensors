@@ -5,6 +5,8 @@
 import asyncio
 
 import csv
+import json
+import tempfile
 
 import os
 
@@ -98,6 +100,8 @@ latest_data = {}
 data_lock = threading.Lock()
 csv_lock = threading.Lock()
 scanner_lock = threading.Lock()
+history_cache_lock = threading.Lock()
+history_cache = {}
 
 scanner_state = {
     "running": False,
@@ -297,12 +301,198 @@ def battery_percent(voltage):
 
 
 
-def read_history(hours=None):
+class HistoryAggregator:
+    """Keep recent detail and stream older readings into UTC-aligned averages."""
+
+    def __init__(self, now):
+        self.now_ms = now.timestamp() * 1000
+        self.recent = []
+        self.buckets = {}
+
+    def add(self, point):
+        age_ms = self.now_ms - point["timestamp_ms"]
+        if age_ms <= 86400000:
+            self.recent.append(point)
+            return
+        period_ms = 3600000 if age_ms <= 30 * 86400000 else 86400000
+        self.add_bucket(point, period_ms, point["temperature"], point["humidity"], 1)
+
+    def add_bucket(self, point, period_ms, temperature_sum, humidity_sum, count):
+        key = (period_ms, int(point["timestamp_ms"] // period_ms))
+        bucket = self.buckets.get(key)
+        if bucket is None:
+            bucket = {"latest": point, "temperature": 0.0,
+                      "humidity": 0.0, "count": 0, "period_ms": period_ms}
+            self.buckets[key] = bucket
+        bucket["temperature"] += temperature_sum
+        bucket["humidity"] += humidity_sum
+        bucket["count"] += count
+        if point["timestamp_ms"] > bucket["latest"]["timestamp_ms"]:
+            bucket["latest"] = point
+
+    def advance(self, now):
+        """Age summaries without rereading source CSVs; retain unrounded sums."""
+        self.now_ms = now.timestamp() * 1000
+        recent, self.recent = self.recent, []
+        changed = False
+        for point in recent:
+            changed |= self.now_ms - point["timestamp_ms"] > 86400000
+            self.add(point)
+        for key, bucket in list(self.buckets.items()):
+            if key[0] == 3600000 and self.now_ms - bucket["latest"]["timestamp_ms"] > 30 * 86400000:
+                del self.buckets[key]
+                self.add_bucket(bucket["latest"], 86400000, bucket["temperature"],
+                                bucket["humidity"], bucket["count"])
+                changed = True
+        return changed
+
+    def points(self):
+        points = list(self.recent)
+        for bucket in self.buckets.values():
+            points.append({
+                **bucket["latest"],
+                "temperature": round(bucket["temperature"] / bucket["count"], 2),
+                "humidity": round(bucket["humidity"] / bucket["count"], 2),
+                "sample_count": bucket["count"],
+                "period_seconds": bucket["period_ms"] // 1000,
+            })
+        return points
+
+
+def history_point(row):
+    timestamp = datetime.fromisoformat(row["timestamp"])
+    return {
+        "timestamp": row["timestamp"], "timestamp_ms": timestamp.timestamp() * 1000,
+        "sequence": int(row["sequence"]), "temperature": float(row["temperature_c"]),
+        "humidity": float(row["humidity_percent"]), "battery_mv": int(row["battery_mv"]),
+        "rssi": int(row["rssi"]),
+    }
+
+
+def file_signature(stat):
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
+
+
+def save_history_cache(path, entry, source_mode):
+    aggregator = entry["aggregator"]
+    payload = {key: value for key, value in entry.items() if key != "aggregator"}
+    payload.update(version=1, recent=aggregator.recent, buckets=list(aggregator.buckets.values()))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=DATA_DIR, prefix=".history-cache-", delete=False) as output:
+            temporary = output.name
+            # Match source CSV access, including launches under different accounts.
+            os.fchmod(output.fileno(), source_mode & 0o666)
+            json.dump(payload, output, separators=(",", ":"))
+        os.replace(temporary, path)
+    except OSError as error:
+        print(f"Could not persist history cache {path}: {error}")
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load_history_cache(path, now):
+    try:
+        with open(path) as source:
+            payload = json.load(source)
+        if payload["version"] != 1:
+            return None
+        aggregator = HistoryAggregator(now)
+        aggregator.recent = payload.pop("recent")
+        for bucket in payload.pop("buckets"):
+            point = bucket["latest"]
+            aggregator.buckets[(bucket["period_ms"], int(point["timestamp_ms"] // bucket["period_ms"]))] = bucket
+        # Validate essential metadata before accepting a rebuildable sidecar.
+        assert len(payload["signature"]) == 4 and payload["offset"] >= 0
+        payload["aggregator"] = aggregator
+        return payload
+    except (OSError, ValueError, KeyError, TypeError, AssertionError, ZeroDivisionError):
+        return None
+
+
+def cached_sensor_history(sensor_id, sensor, now):
+    """Incrementally summarize append-only CSVs; replacement/truncation rebuilds."""
+    path = os.path.join(DATA_DIR, sensor["file"])
+    cache_path = os.path.join(DATA_DIR, f".history-cache-{sensor_id}.json")
+    entry = history_cache.get(path)
+    if entry is None:
+        entry = load_history_cache(cache_path, now)
+    # The caller owns history_cache_lock. Keep lock ordering cache -> CSV.
+    with csv_lock:
+        if not os.path.exists(path):
+            history_cache.pop(path, None)
+            return {"aggregator": HistoryAggregator(now), "latest": None, "last_full_charge": None}
+        with open(path, "rb") as source:
+            source_stat = os.fstat(source.fileno())
+            source_mode = source_stat.st_mode
+            signature = file_signature(source_stat)
+            previous = entry["signature"] if entry else None
+            # Same inode with growth is the supported append path. Same-size edits,
+            # truncation, and atomic replacement all invalidate derived summaries.
+            if previous is not None and (previous[:2] != signature[:2]
+                    or signature[2] < previous[2]
+                    or (signature[2] == previous[2] and signature[3] != previous[3])):
+                entry = None
+            if entry is None:
+                entry = dict(aggregator=HistoryAggregator(now), signature=signature,
+                             offset=0, latest=None, last_full_charge=None)
+                dirty = True
+            else:
+                dirty = entry["aggregator"].advance(now)
+            source.seek(entry["offset"])
+            if entry["offset"] == 0:
+                header = source.readline()
+                if next(csv.reader([header.decode("utf-8")]), []) != CSV_HEADER:
+                    raise ValueError(f"Unexpected CSV header in {path}")
+                entry["offset"] = source.tell()
+            while True:
+                line = source.readline()
+                if not line or not line.endswith(b"\n"):
+                    break  # Retry a partially appended row on the next request.
+                entry["offset"] = source.tell()
+                dirty = True
+                try:
+                    row = next(csv.DictReader([line.decode("utf-8")], fieldnames=CSV_HEADER))
+                    point = history_point(row)
+                except (ValueError, KeyError, TypeError, UnicodeError, csv.Error):
+                    continue
+                entry["aggregator"].add(point)
+                if entry["latest"] is None or point["timestamp_ms"] >= entry["latest"]["timestamp_ms"]:
+                    entry["latest"] = point
+                if battery_percent(point["battery_mv"] / 1000.0) == 100:
+                    full = entry["last_full_charge"]
+                    if full is None or point["timestamp_ms"] > datetime.fromisoformat(full).timestamp() * 1000:
+                        entry["last_full_charge"] = point["timestamp"]
+            entry["signature"] = signature
+    history_cache[path] = entry
+    if dirty:
+        save_history_cache(cache_path, entry, source_mode)
+    return entry
+
+
+def read_cached_history(hours=None):
+    now = datetime.now().astimezone()
+    cutoff = -float("inf") if hours is None else (now - timedelta(hours=hours)).timestamp() * 1000
+    result = {}
+    with history_cache_lock:
+        for sensor_id, sensor in SENSORS.items():
+            entry = cached_sensor_history(sensor_id, sensor, now)
+            points = [point for point in entry["aggregator"].points() if point["timestamp_ms"] >= cutoff]
+            points.sort(key=lambda point: point["timestamp_ms"])
+            result[str(sensor_id)] = dict(name=sensor["name"], color=sensor["color"], points=points)
+    return result
+
+
+def read_history(hours=None, aggregate=False):
+    if aggregate:
+        return read_cached_history(hours)
 
     result = {}
 
 
 
+    now = datetime.now().astimezone()
     cutoff = None
 
 
@@ -311,9 +501,7 @@ def read_history(hours=None):
 
         cutoff = (
 
-            datetime.now().astimezone()
-
-            - timedelta(hours=hours)
+            now - timedelta(hours=hours)
 
         )
 
@@ -371,7 +559,7 @@ def read_history(hours=None):
 
 
 
-                                points.append({
+                                point = {
 
                                     "timestamp":
 
@@ -413,7 +601,8 @@ def read_history(hours=None):
 
                                         int(row["rssi"]),
 
-                                })
+                                }
+                                points.append(point)
 
 
 
@@ -2322,7 +2511,12 @@ html, body {
 .title-area { gap: 8px; }
 .title { font-size: 18px; }
 .logo { width: 30px; height: 30px; }
-.history-controls { width: 100%; }
+.history-controls {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(var(--range-columns, 5), minmax(0, 1fr));
+    gap: 2px;
+}
 .history-controls button { flex: 1; min-width: 0; padding: 6px 4px; }
 .sensor-grid { grid-template-columns: minmax(0, 1fr); gap: 6px; }
 .sensor-card { padding: 7px 10px; }
@@ -2354,8 +2548,11 @@ html, body {
     .dashboard { padding: 12px 16px; gap: 10px; }
     .header { flex-direction: row; align-items: center; gap: 16px; }
     .title { font-size: 20px; }
-    .history-controls { width: auto; }
-    .history-controls button { min-width: 43px; }
+    .history-controls {
+        width: auto;
+        grid-template-columns: repeat(var(--range-count, 5), minmax(0, 1fr));
+    }
+    .history-controls button { min-width: 0; padding: 6px 7px; }
     .sensor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     .sensor-card { padding: 10px 13px; }
     .value-number { font-size: clamp(25px, 2.2vw, 34px); }
@@ -2370,7 +2567,10 @@ html, body {
     .header { flex-direction: row; align-items: center; gap: 6px; }
     .title { font-size: 14px; }
     .subtitle, .logo { display: none; }
-    .history-controls { width: auto; flex: 1; max-width: 280px; }
+    .history-controls {
+        width: auto; flex: 1; max-width: 320px;
+        grid-template-columns: repeat(var(--range-columns, 5), minmax(0, 1fr));
+    }
     .history-controls button { min-width: 0; padding: 5px 3px; }
     .sensor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
     .sensor-card { padding: 5px 7px; }
@@ -2453,72 +2653,12 @@ html, body {
 
 
 
-        <div class="history-controls">
-
-
-
-            <button
-
-                type="button"
-
-                data-hours="1">
-
-                1h
-
-            </button>
-
-
-
-            <button
-
-                type="button"
-
-                data-hours="6">
-
-                6h
-
-            </button>
-
-
-
-            <button
-
-                type="button"
-
-                data-hours="24"
-
-                class="active">
-
-                24h
-
-            </button>
-
-
-
-            <button
-
-                type="button"
-
-                data-hours="168">
-
-                7d
-
-            </button>
-
-
-
-            <button
-
-                type="button"
-
-                data-hours="all">
-
-                All
-
-            </button>
-
-
-
+        <div class="history-controls" role="group" aria-label="History time range">
+            <button type="button" data-hours="1" aria-pressed="false">1h</button>
+            <button type="button" data-hours="12" aria-pressed="false">12h</button>
+            <button type="button" data-hours="24" class="active" aria-pressed="true">1d</button>
+            <button type="button" data-hours="168" aria-pressed="false">7d</button>
+            <button type="button" data-hours="all" aria-pressed="false">All</button>
         </div>
 
 
@@ -2705,7 +2845,8 @@ let humidityChart = null;
 
 
 
-let lastHistorySignature = "";
+let cachedHistory = null;
+let historyRequest = null;
 
 
 
@@ -3489,19 +3630,7 @@ function formatGraphTime(milliseconds) {
 
 
 
-    if (
-
-        historyHours === 1
-
-        ||
-
-        historyHours === 6
-
-        ||
-
-        historyHours === 24
-
-    ) {
+    if (historyHours !== "all" && Number(historyHours) <= 24) {
 
 
 
@@ -3549,19 +3678,10 @@ function formatGraphTime(milliseconds) {
 
 
 
-    return date.toLocaleDateString(
-
-        [],
-
-        {
-
-            month: "short",
-
-            day: "numeric"
-
-        }
-
-    );
+    const longRange = historyHours === "all" || Number(historyHours) >= 8760;
+    return date.toLocaleDateString([], longRange
+        ? {month: "short", year: "2-digit"}
+        : {month: "short", day: "numeric"});
 
 }
 
@@ -4851,6 +4971,32 @@ function alignedTimeTicks(scale) {
     const minute = 60000;
     const span = scale.max - scale.min;
     const target = window.innerWidth <= 700 ? 5 : 9;
+    if (span > 60 * 86400000) {
+        const months = span / (30.4375 * 86400000);
+        const step = [1, 2, 3, 6, 12, 24, 60, 120].find(value => months / value <= target)
+            || Math.ceil(months / target / 12) * 12;
+        const date = new Date(scale.min);
+        date.setDate(1);
+        date.setHours(0, 0, 0, 0);
+        const monthIndex = date.getFullYear() * 12 + date.getMonth();
+        date.setFullYear(Math.floor(Math.floor(monthIndex / step) * step / 12));
+        date.setMonth((Math.floor(monthIndex / step) * step) % 12);
+        const ticks = [];
+        while (date.getTime() <= scale.max) {
+            const start = date.getTime();
+            date.setMonth(date.getMonth() + step);
+            const end = date.getTime();
+            for (let part = 0; part < 4; part++) {
+                const value = start + (end - start) * part / 4;
+                if (value >= scale.min && value <= scale.max) {
+                    ticks.push({value, major: part === 0});
+                }
+            }
+        }
+        scale.ticks = ticks;
+        scale.options.ticks.maxTicksLimit = ticks.length;
+        return;
+    }
     const intervals = [10, 20, 30, 60, 120, 180, 360, 720, 1440, 2880, 10080];
     const spacing = intervals.find(value => span / (value * minute) <= target) || 10080;
     const ticks = [];
@@ -5596,110 +5742,6 @@ function createChart(
 
 
 
-function historySignature(history) {
-
-
-
-    const parts = [];
-
-
-
-
-
-    for (
-
-        const sensorId
-
-        of Object.keys(history).sort()
-
-    ) {
-
-
-
-        const points =
-
-            history[sensorId].points;
-
-
-
-
-
-        if (points.length === 0) {
-
-
-
-            parts.push(
-
-                sensorId + ":empty"
-
-            );
-
-
-
-            continue;
-
-        }
-
-
-
-
-
-        const last =
-
-            points[
-
-                points.length - 1
-
-            ];
-
-
-
-
-
-        parts.push(
-
-            sensorId
-
-            +
-
-            ":"
-
-            +
-
-            points.length
-
-            +
-
-            ":"
-
-            +
-
-            last.sequence
-
-            +
-
-            ":"
-
-            +
-
-            last.timestamp_ms
-
-        );
-
-    }
-
-
-
-
-
-    return parts.join("|");
-
-}
-
-
-
-
-
 // ============================================================
 
 // Update graph history
@@ -5708,268 +5750,179 @@ function historySignature(history) {
 
 
 
-async function updateHistory(
+// Familiar short dashboard presets, followed by a logarithmic 1-2-5 year ladder.
+// Inspiration: Grafana relative ranges and https://d3js.org/d3-array/ticks.
+const CORE_HISTORY_RANGES = [
+    {hours: 1, label: "1h"}, {hours: 12, label: "12h"},
+    {hours: 24, label: "1d"}, {hours: 168, label: "7d"},
+];
 
-    force = false
-
-) {
-
-
-
-    try {
-
-
-
-        let url =
-
-            "/api/history";
-
-
-
-
-
-        if (
-
-            historyHours !== "all"
-
-        ) {
-
-
-
-            url +=
-
-                "?hours="
-
-                +
-
-                historyHours;
-
+function availableHistoryRanges(history) {
+    let first = Infinity;
+    let last = -Infinity;
+    for (const sensor of Object.values(history)) {
+        for (const point of sensor.points) {
+            if (!Number.isFinite(point.timestamp_ms)) continue;
+            first = Math.min(first, point.timestamp_ms);
+            last = Math.max(last, point.timestamp_ms);
         }
-
-
-
-
-
-        const response =
-
-            await fetch(
-
-                url,
-
-                {
-
-                    cache: "no-store"
-
-                }
-
-            );
-
-
-
-
-
-        if (!response.ok) {
-
-
-
-            throw new Error(
-
-                `HTTP ${response.status}`
-
-            );
-
-        }
-
-
-
-
-
-        const history =
-
-            await response.json();
-
-
-
-
-
-        const signature =
-
-            historySignature(history);
-
-
-
-
-
-        if (
-
-            !force
-
-            &&
-
-            signature === lastHistorySignature
-
-        ) {
-
-            return;
-
-        }
-
-
-
-
-
-        lastHistorySignature =
-
-            signature;
-
-
-
-
-
-        const sensors =
-
-            Object.values(history)
-
-            .filter(
-
-
-
-                sensor =>
-
-                    sensor.points.length > 0
-
-
-
-            );
-
-
-
-
-
-        const temperatureDatasets =
-
-            sensors.map(
-
-
-
-                sensor =>
-
-                    makeDataset(
-
-                        sensor,
-
-                        "temperature"
-
-                    )
-
-
-
-            );
-
-
-
-
-
-        const humidityDatasets =
-
-            sensors.map(
-
-
-
-                sensor =>
-
-                    makeDataset(
-
-                        sensor,
-
-                        "humidity"
-
-                    )
-
-
-
-            );
-
-
-
-
-
-        if (temperatureChart) {
-
-            temperatureChart.destroy();
-
-        }
-
-
-
-
-
-        if (humidityChart) {
-
-            humidityChart.destroy();
-
-        }
-
-
-
-
-
-        temperatureChart =
-
-            createChart(
-
-                "temperature-chart",
-
-                "temperature",
-
-                temperatureDatasets
-
-            );
-
-
-
-
-
-        humidityChart =
-
-            createChart(
-
-                "humidity-chart",
-
-                "humidity",
-
-                humidityDatasets
-
-            );
-
-
-
     }
-
-
-
-    catch (error) {
-
-
-
-        console.error(
-
-            "History update failed:",
-
-            error
-
-        );
-
-
-
+    const spanHours = Math.max(0, (last - first) / 3600000);
+    const ranges = [...CORE_HISTORY_RANGES];
+    for (const days of [30, 90]) {
+        if (days * 24 <= spanHours) ranges.push({hours: days * 24, label: `${days}d`});
     }
-
-
-
+    // Years are rolling 365-day windows, consistent with the graph's hour-based ranges.
+    // Generate indefinitely as coverage grows: 1, 2, 5, 10, 20, 50, 100 ... years.
+    for (let decade = 1; decade * 8760 <= spanHours; decade *= 10) {
+        for (const multiple of [1, 2, 5]) {
+            const years = multiple * decade;
+            if (years * 8760 <= spanHours) ranges.push({hours: years * 8760, label: `${years}y`});
+        }
+    }
+    ranges.push({hours: "all", label: "All"});
+    return ranges;
 }
 
+function updateHistoryControls(history) {
+    const ranges = availableHistoryRanges(history);
+    if (!ranges.some(range => range.hours === historyHours)) historyHours = "all";
+    const controls = document.querySelector(".history-controls");
+    const signature = ranges.map(range => range.hours).join(",");
+    // Preserve focus on unchanged controls during background refreshes.
+    if (controls.dataset.ranges !== signature) {
+        controls.replaceChildren(...ranges.map(range => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.dataset.hours = range.hours;
+            button.textContent = range.label;
+            return button;
+        }));
+        controls.dataset.ranges = signature;
+        controls.style.setProperty("--range-count", ranges.length);
+        controls.style.setProperty("--range-columns", Math.min(6, Math.ceil(ranges.length / 2)));
+    }
+    for (const button of controls.querySelectorAll("button")) {
+        const selected = button.dataset.hours === String(historyHours);
+        button.classList.toggle("active", selected);
+        button.setAttribute("aria-pressed", String(selected));
+    }
+}
 
+function uniformHistory(history, rangeHours, now = Date.now()) {
+    const cutoff = rangeHours === "all" ? -Infinity : now - Number(rangeHours) * 3600000;
+    const sensors = Object.values(history).map(sensor => ({
+        ...sensor,
+        points: sensor.points.filter(point => point.timestamp_ms >= cutoff && point.timestamp_ms <= now)
+    })).filter(sensor => sensor.points.length > 0);
+    let first = now;
+    let sourcePeriod = 600;
+    for (const sensor of sensors) {
+        for (const point of sensor.points) {
+            first = Math.min(first, point.timestamp_ms);
+            sourcePeriod = Math.max(sourcePeriod, point.period_seconds || 600);
+        }
+    }
+    const spanSeconds = rangeHours === "all" ? (now - first) / 1000 : Number(rangeHours) * 3600;
+    // Use one common interval for every sensor and both measurements. Never
+    // pretend daily source averages have hourly detail. Cap long views near
+    // 800 points per sensor using whole multiples of existing bucket periods.
+    const minimumPeriod = Math.max(sourcePeriod, spanSeconds / 800);
+    const periods = [600, 1800, 3600, 10800, 21600, 43200, 86400,
+                     259200, 604800, 1209600, 2592000, 7776000, 31536000];
+    const periodSeconds = periods.find(period => period >= minimumPeriod)
+        || Math.ceil(minimumPeriod / 31536000) * 31536000;
+    const intervalMs = periodSeconds * 1000;
+    const result = sensors.map(sensor => {
+        const buckets = new Map();
+        for (const point of sensor.points) {
+            const key = Math.floor(point.timestamp_ms / intervalMs);
+            let bucket = buckets.get(key);
+            if (!bucket) {
+                bucket = {latest: point, count: 0, temperature: 0, humidity: 0};
+                buckets.set(key, bucket);
+            }
+            // An hourly average represents more readings than a single raw
+            // sample. Weight by those counts when combining summaries.
+            const count = point.sample_count || 1;
+            bucket.temperature += point.temperature * count;
+            bucket.humidity += point.humidity * count;
+            bucket.count += count;
+            if (point.timestamp_ms > bucket.latest.timestamp_ms) bucket.latest = point;
+        }
+        return {...sensor, points: [...buckets.values()].map(bucket => ({
+            ...bucket.latest,
+            temperature: bucket.temperature / bucket.count,
+            humidity: bucket.humidity / bucket.count,
+            sample_count: bucket.count,
+            period_seconds: periodSeconds,
+        })).sort((a, b) => a.timestamp_ms - b.timestamp_ms)};
+    });
+    return {sensors: result, periodSeconds};
+}
 
+function historyResolutionLabel(seconds) {
+    if (seconds < 3600) return `${seconds / 60}-minute averages`;
+    if (seconds === 3600) return "Hourly averages";
+    if (seconds < 86400) return `${seconds / 3600}-hour averages`;
+    if (seconds === 86400) return "Daily averages";
+    return `${seconds / 86400}-day averages`;
+}
+
+function renderHistory(history) {
+    updateHistoryControls(history);
+    const {sensors, periodSeconds} = uniformHistory(history, historyHours);
+    for (const unit of document.querySelectorAll(".chart-unit")) {
+        if (!unit.dataset.unit) unit.dataset.unit = unit.textContent.trim();
+        unit.textContent = `${unit.dataset.unit} · ${historyResolutionLabel(periodSeconds)}`;
+    }
+
+    function updateChart(chart, canvasId, type) {
+        const datasets = sensors.map(sensor => makeDataset(sensor, type));
+        if (!chart) return createChart(canvasId, type, datasets);
+        const visibility = new Map(chart.data.datasets.map((dataset, index) =>
+            [dataset.label, chart.isDatasetVisible(index)]));
+        chart.data.datasets = datasets;
+        chart.options = chartOptions(type, datasets);
+        datasets.forEach((dataset, index) => {
+            if (visibility.has(dataset.label)) {
+                chart.setDatasetVisibility(index, visibility.get(dataset.label));
+            }
+        });
+        chart.$inspectionX = null;
+        chart.$inspectionTime = null;
+        chart.update("none");
+        return chart;
+    }
+    temperatureChart = updateChart(temperatureChart, "temperature-chart", "temperature");
+    humidityChart = updateChart(humidityChart, "humidity-chart", "humidity");
+}
+
+async function updateHistory(force = false) {
+    // Range switches use local data; only initial load and the timer fetch history.
+    if (force && cachedHistory !== null) {
+        renderHistory(cachedHistory);
+        return;
+    }
+    if (historyRequest) return historyRequest;
+    historyRequest = (async () => {
+        try {
+            const response = await fetch("/api/history", { cache: "no-store" });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const history = await response.json();
+            cachedHistory = history;
+            // Render the currently selected range, even if it changed during fetch.
+            renderHistory(history);
+        } catch (error) {
+            console.error("History update failed:", error);
+        }
+    })();
+    try {
+        await historyRequest;
+    } finally {
+        historyRequest = null;
+    }
+}
 
 
 // ============================================================
@@ -6173,149 +6126,17 @@ async function updateSensors() {
 
 
 
-document
-
-    .querySelectorAll(
-
-        ".history-controls button"
-
-    )
-
-    .forEach(
-
-
-
-        button => {
-
-
-
-            button.addEventListener(
-
-
-
-                "click",
-
-
-
-                async () => {
-
-
-
-
-
-                    document
-
-                        .querySelectorAll(
-
-                            ".history-controls button"
-
-                        )
-
-                        .forEach(
-
-
-
-                            other =>
-
-                                other.classList.remove(
-
-                                    "active"
-
-                                )
-
-
-
-                        );
-
-
-
-
-
-                    button.classList.add(
-
-                        "active"
-
-                    );
-
-
-
-
-
-                    const value =
-
-                        button.dataset.hours;
-
-
-
-
-
-                    if (
-
-                        value === "all"
-
-                    ) {
-
-
-
-                        historyHours =
-
-                            "all";
-
-
-
-                    }
-
-
-
-                    else {
-
-
-
-                        historyHours =
-
-                            Number(value);
-
-
-
-                    }
-
-
-
-
-
-                    lastHistorySignature =
-
-                        "";
-
-
-
-
-
-                    await updateHistory(
-
-                        true
-
-                    );
-
-
-
-                }
-
-
-
-            );
-
-
-
-        }
-
-
-
-    );
-
-
-
-
+document.querySelector(".history-controls").addEventListener("click", event => {
+    const button = event.target.closest("button[data-hours]");
+    if (!button) return;
+    historyHours = button.dataset.hours === "all" ? "all" : Number(button.dataset.hours);
+    for (const other of document.querySelectorAll(".history-controls button")) {
+        const selected = other === button;
+        other.classList.toggle("active", selected);
+        other.setAttribute("aria-pressed", String(selected));
+    }
+    updateHistory(true);
+});
 
 // ============================================================
 
@@ -6484,7 +6305,7 @@ def api_history():
 
     return jsonify(
 
-        read_history(hours)
+        read_history(hours, aggregate=True)
 
     )
 
@@ -6501,29 +6322,24 @@ def api_history():
 
 
 def restore_latest_data():
-    """Restore sensor cards from the most recent saved CSV measurements."""
-    history = read_history()
-    with data_lock:
+    """Restore exact latest measurements and charge dates from the derived cache."""
+    restored = {}
+    now = datetime.now().astimezone()
+    with history_cache_lock:
         for sensor_id, sensor in SENSORS.items():
-            points = history[str(sensor_id)]["points"]
-            if not points:
+            entry = cached_sensor_history(sensor_id, sensor, now)
+            if entry["latest"] is None:
                 continue
-            packet = dict(points[-1])
+            packet = dict(entry["latest"])
             voltage = packet["battery_mv"] / 1000.0
             packet.update(
-                sensor_id=sensor_id,
-                protocol=1,
-                name=sensor["name"],
-                color=sensor["color"],
-                battery_voltage=voltage,
-                battery_percent=battery_percent(voltage),
-                last_full_charge=next(
-                    (point["timestamp"] for point in reversed(points)
-                     if battery_percent(point["battery_mv"] / 1000.0) == 100),
-                    None,
-                ),
+                sensor_id=sensor_id, protocol=1, name=sensor["name"], color=sensor["color"],
+                battery_voltage=voltage, battery_percent=battery_percent(voltage),
+                last_full_charge=entry["last_full_charge"],
             )
-            latest_data[sensor_id] = packet
+            restored[sensor_id] = packet
+    with data_lock:
+        latest_data.update(restored)
 
 
 if __name__ == "__main__":
