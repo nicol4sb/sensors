@@ -5107,14 +5107,18 @@ function alignedTimeTicks(scale) {
         date.setHours(0, 0, 0, 0);
         if (date.getTime() < scale.min) date.setDate(date.getDate() + 1);
         while (date.getTime() <= scale.max) {
-            ticks.push({ value: date.getTime() });
+            ticks.push({ value: date.getTime(), major: true });
             date.setDate(date.getDate() + spacing / 1440);
         }
     } else {
-        const step = spacing * minute;
+        // Keep labels readable while adding intermediate time graduations.
+        const majorStep = spacing * minute;
+        const step = majorStep / (spacing >= 60 ? 4 : 2);
         const offset = new Date(scale.min).getTimezoneOffset() * minute;
         let value = Math.ceil((scale.min - offset) / step) * step + offset;
-        for (; value <= scale.max; value += step) ticks.push({ value });
+        for (; value <= scale.max; value += step) {
+            ticks.push({ value, major: (value - offset) % majorStep === 0 });
+        }
     }
     scale.ticks = ticks;
 }
@@ -5413,13 +5417,15 @@ function chartOptions(type, datasets) {
 
                     color:
 
-                        "rgba(170,190,215,0.08)",
+                        context => context.tick.major
+                            ? "rgba(170,190,215,0.18)"
+                            : "rgba(170,190,215,0.08)",
 
 
 
                     drawTicks:
 
-                        false
+                        true
 
 
 
@@ -5463,7 +5469,7 @@ function chartOptions(type, datasets) {
 
                     autoSkip:
 
-                        true,
+                        false,
 
 
 
@@ -5491,7 +5497,8 @@ function chartOptions(type, datasets) {
 
                     callback:
 
-                        function(value) {
+                        function(value, index, ticks) {
+                            if (!ticks[index].major) return "";
 
 
 
