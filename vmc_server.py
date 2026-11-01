@@ -645,6 +645,10 @@ def detection_callback(device, advertisement_data):
 
 
 
+        packet["last_full_charge"] = (
+            packet["timestamp"] if packet["battery_percent"] == 100
+            else previous.get("last_full_charge") if previous else None
+        )
         latest_data[sensor_id] = packet
 
 
@@ -2277,6 +2281,18 @@ body {
 
 
 
+.battery-values {
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 2px 5px;
+}
+.charge-age {
+    grid-column: 1 / -1;
+    color: var(--text-secondary);
+    font-size: 9px;
+    white-space: nowrap;
+}
+
 /* Mobile-first viewport layout: reserve chrome, share all remaining space. */
 html, body {
     height: 100%;
@@ -3279,6 +3295,12 @@ function sensorCard(sensor) {
 
                                 ${sensor.battery_voltage.toFixed(3)} V
 
+                            </span>
+                            <span class="charge-age"
+                                  title="Time since the last recorded 100% battery estimate">
+                                ${sensor.days_since_full_charge == null
+                                    ? "Last charge unknown"
+                                    : `${sensor.days_since_full_charge} ${sensor.days_since_full_charge === 1 ? "day" : "days"} since 100%`}
                             </span>
 
 
@@ -6407,6 +6429,13 @@ def api_sensors():
 
 
 
+    now = datetime.now().astimezone().timestamp()
+    for data in result.values():
+        last_full = data.get("last_full_charge")
+        data["days_since_full_charge"] = (
+            max(0, int((now - datetime.fromisoformat(last_full).timestamp()) // 86400))
+            if last_full else None
+        )
     return jsonify(result)
 
 
@@ -6488,6 +6517,11 @@ def restore_latest_data():
                 color=sensor["color"],
                 battery_voltage=voltage,
                 battery_percent=battery_percent(voltage),
+                last_full_charge=next(
+                    (point["timestamp"] for point in reversed(points)
+                     if battery_percent(point["battery_mv"] / 1000.0) == 100),
+                    None,
+                ),
             )
             latest_data[sensor_id] = packet
 
