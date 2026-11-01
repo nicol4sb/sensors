@@ -5106,9 +5106,18 @@ function alignedTimeTicks(scale) {
         const date = new Date(scale.min);
         date.setHours(0, 0, 0, 0);
         if (date.getTime() < scale.min) date.setDate(date.getDate() + 1);
+        // Include the preceding interval so minor ticks reach both edges.
+        date.setDate(date.getDate() - spacing / 1440);
         while (date.getTime() <= scale.max) {
-            ticks.push({ value: date.getTime(), major: true });
+            const start = date.getTime();
             date.setDate(date.getDate() + spacing / 1440);
+            const end = date.getTime();
+            for (let part = 0; part < 4; part++) {
+                const value = start + (end - start) * part / 4;
+                if (value >= scale.min && value <= scale.max) {
+                    ticks.push({ value, major: part === 0 });
+                }
+            }
         }
     } else {
         // Keep labels readable while adding intermediate time graduations.
@@ -5121,6 +5130,26 @@ function alignedTimeTicks(scale) {
         }
     }
     scale.ticks = ticks;
+    // Chart.js also uses this limit when drawing grid lines and tick marks.
+    scale.options.ticks.maxTicksLimit = ticks.length;
+}
+
+// Subdivide Chart.js's existing numeric graduations without moving labels.
+function intermediateValueTicks(scale) {
+    const majors = scale.ticks;
+    const ticks = [];
+    majors.forEach((tick, index) => {
+        ticks.push({ ...tick, major: true });
+        if (index + 1 < majors.length) {
+            const step = (majors[index + 1].value - tick.value) / 4;
+            for (let part = 1; part < 4; part++) {
+                ticks.push({ value: tick.value + step * part, major: false });
+            }
+        }
+    });
+    scale.ticks = ticks;
+    // Chart.js also uses this limit when drawing grid lines and tick marks.
+    scale.options.ticks.maxTicksLimit = ticks.length;
 }
 
 function chartOptions(type, datasets) {
@@ -5413,13 +5442,19 @@ function chartOptions(type, datasets) {
 
                 grid: {
 
+                    tickLength: 8,
+                    tickColor: context => context.tick.major
+                        ? "rgba(190,210,235,0.85)"
+                        : "rgba(170,190,215,0.45)",
+                    tickWidth: context => context.tick.major ? 2 : 1,
+
 
 
                     color:
 
                         context => context.tick.major
-                            ? "rgba(170,190,215,0.18)"
-                            : "rgba(170,190,215,0.08)",
+                            ? "rgba(170,190,215,0.24)"
+                            : "rgba(170,190,215,0.11)",
 
 
 
@@ -5441,7 +5476,7 @@ function chartOptions(type, datasets) {
 
                     color:
 
-                        "#7e8b9c",
+                        "#a5b3c5",
 
 
 
@@ -5479,7 +5514,7 @@ function chartOptions(type, datasets) {
 
                         size:
 
-                            9,
+                            10,
 
 
 
@@ -5523,6 +5558,9 @@ function chartOptions(type, datasets) {
 
 
             y: {
+                // Reset the label budget before generating the next set of ticks.
+                beforeBuildTicks: scale => { scale.options.ticks.maxTicksLimit = 6; },
+                afterBuildTicks: intermediateValueTicks,
 
 
 
@@ -5548,13 +5586,15 @@ function chartOptions(type, datasets) {
 
                     color:
 
-                        "rgba(170,190,215,0.10)",
+                        context => context.tick.major
+                            ? "rgba(170,190,215,0.16)"
+                            : "rgba(170,190,215,0.06)",
 
 
 
                     drawTicks:
 
-                        false
+                        true
 
 
 
@@ -5565,6 +5605,7 @@ function chartOptions(type, datasets) {
 
 
                 ticks: {
+                    autoSkip: false,
 
 
 
@@ -5610,7 +5651,8 @@ function chartOptions(type, datasets) {
 
                     callback:
 
-                        function(value) {
+                        function(value, index, ticks) {
+                            if (!ticks[index].major) return "";
 
 
 
