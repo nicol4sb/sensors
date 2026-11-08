@@ -57,7 +57,7 @@
 
 #if SENSOR_ID == 4
 // Mains power: keep the latest sample available between measurements.
-static const uint32_t MEASUREMENT_INTERVAL_MS = 60000UL;
+static const uint32_t MEASUREMENT_INTERVAL_MS = 600UL;
 static const uint16_t ADVERTISING_TIMEOUT_SECONDS = 0; // No timeout.
 #else
 // Battery power: a short advertising burst every ten minutes.
