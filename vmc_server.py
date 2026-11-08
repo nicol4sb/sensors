@@ -51,7 +51,7 @@ SENSORS = {
 
     1: {
 
-        "name": "Red",
+        "name": "salon",
 
         "color": "#ff5a5f",
 
@@ -61,7 +61,7 @@ SENSORS = {
 
     2: {
 
-        "name": "Green",
+        "name": "Parents",
 
         "color": "#35d07f",
 
@@ -71,11 +71,41 @@ SENSORS = {
 
     3: {
 
-        "name": "Sensor 3",
+        "name": "outside",
 
         "color": "#5da9ff",
 
         "file": "sensor3.csv",
+
+    },
+
+    4: {
+
+        "name": "Sensor 4",
+
+        "color": "#f5b942",
+
+        "file": "sensor4.csv",
+
+    },
+
+    5: {
+
+        "name": "Sensor 5",
+
+        "color": "#b38cff",
+
+        "file": "sensor5.csv",
+
+    },
+
+    6: {
+
+        "name": "Sensor 6",
+
+        "color": "#36c9c6",
+
+        "file": "sensor6.csv",
 
     },
 
@@ -3977,7 +4007,7 @@ function makeDataset(
 
         pointRadius:
 
-            points.length === 1 ? 3 : 0,
+            points.length === 1 ? 3 : points.length <= 30 ? 2 : 0,
 
 
 
@@ -4975,6 +5005,7 @@ function alignedTimeTicks(scale) {
         const months = span / (30.4375 * 86400000);
         const step = [1, 2, 3, 6, 12, 24, 60, 120].find(value => months / value <= target)
             || Math.ceil(months / target / 12) * 12;
+        const minorStep = step >= 12 ? 12 : 1;
         const date = new Date(scale.min);
         date.setDate(1);
         date.setHours(0, 0, 0, 0);
@@ -4983,15 +5014,12 @@ function alignedTimeTicks(scale) {
         date.setMonth((Math.floor(monthIndex / step) * step) % 12);
         const ticks = [];
         while (date.getTime() <= scale.max) {
-            const start = date.getTime();
-            date.setMonth(date.getMonth() + step);
-            const end = date.getTime();
-            for (let part = 0; part < 4; part++) {
-                const value = start + (end - start) * part / 4;
-                if (value >= scale.min && value <= scale.max) {
-                    ticks.push({value, major: part === 0});
-                }
+            const value = date.getTime();
+            const index = date.getFullYear() * 12 + date.getMonth();
+            if (value >= scale.min) {
+                ticks.push({value, major: index % step === 0});
             }
+            date.setMonth(date.getMonth() + minorStep);
         }
         scale.ticks = ticks;
         scale.options.ticks.maxTicksLimit = ticks.length;
@@ -5006,21 +5034,28 @@ function alignedTimeTicks(scale) {
         if (date.getTime() < scale.min) date.setDate(date.getDate() + 1);
         // Include the preceding interval so minor ticks reach both edges.
         date.setDate(date.getDate() - spacing / 1440);
+        const majorDays = spacing / 1440;
+        const minorHours = majorDays === 1 ? 6 : 24;
         while (date.getTime() <= scale.max) {
-            const start = date.getTime();
-            date.setDate(date.getDate() + spacing / 1440);
-            const end = date.getTime();
-            for (let part = 0; part < 4; part++) {
-                const value = start + (end - start) * part / 4;
+            const start = new Date(date);
+            date.setDate(date.getDate() + majorDays);
+            // Advance through local calendar boundaries, including DST changes.
+            const minor = new Date(start);
+            while (minor.getTime() < date.getTime()) {
+                const value = minor.getTime();
                 if (value >= scale.min && value <= scale.max) {
-                    ticks.push({ value, major: part === 0 });
+                    ticks.push({ value, major: value === start.getTime() });
                 }
+                minor.setHours(minor.getHours() + minorHours);
             }
         }
     } else {
-        // Keep labels readable while adding intermediate time graduations.
+        // Use clock intervals rather than dividing each label gap into quarters.
+        // In particular, 09:00 -> 12:00 has only 10:00 and 11:00 between them.
         const majorStep = spacing * minute;
-        const step = majorStep / (spacing >= 60 ? 4 : 2);
+        const minorMinutes = spacing >= 720 ? 180 : spacing >= 60 ? 60
+            : spacing === 30 ? 10 : spacing / 2;
+        const step = minorMinutes * minute;
         const offset = new Date(scale.min).getTimezoneOffset() * minute;
         let value = Math.ceil((scale.min - offset) / step) * step + offset;
         for (; value <= scale.max; value += step) {
@@ -5102,7 +5137,7 @@ function chartOptions(type, datasets) {
 
         normalized:
 
-            true,
+            false,
 
 
 
@@ -5816,19 +5851,26 @@ function uniformHistory(history, rangeHours, now = Date.now()) {
         points: sensor.points.filter(point => point.timestamp_ms >= cutoff && point.timestamp_ms <= now)
     })).filter(sensor => sensor.points.length > 0);
     let first = now;
-    let sourcePeriod = 600;
+    let sourcePeriod = 0;
+    let largestSeries = 0;
     for (const sensor of sensors) {
+        largestSeries = Math.max(largestSeries, sensor.points.length);
         for (const point of sensor.points) {
             first = Math.min(first, point.timestamp_ms);
-            sourcePeriod = Math.max(sourcePeriod, point.period_seconds || 600);
+            sourcePeriod = Math.max(sourcePeriod, point.period_seconds || 0);
         }
+    }
+    // Keep small raw series intact, including a newly added sensor sampling
+    // faster than ten minutes. Otherwise dozens of readings can become one dot.
+    if (sourcePeriod === 0 && largestSeries <= 800) {
+        return {sensors, periodSeconds: 0};
     }
     const spanSeconds = rangeHours === "all" ? (now - first) / 1000 : Number(rangeHours) * 3600;
     // Use one common interval for every sensor and both measurements. Never
     // pretend daily source averages have hourly detail. Cap long views near
     // 800 points per sensor using whole multiples of existing bucket periods.
     const minimumPeriod = Math.max(sourcePeriod, spanSeconds / 800);
-    const periods = [600, 1800, 3600, 10800, 21600, 43200, 86400,
+    const periods = [1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 10800, 21600, 43200, 86400,
                      259200, 604800, 1209600, 2592000, 7776000, 31536000];
     const periodSeconds = periods.find(period => period >= minimumPeriod)
         || Math.ceil(minimumPeriod / 31536000) * 31536000;
@@ -5862,6 +5904,8 @@ function uniformHistory(history, rangeHours, now = Date.now()) {
 }
 
 function historyResolutionLabel(seconds) {
+    if (seconds === 0) return "Recorded readings";
+    if (seconds < 60) return `${seconds}-second averages`;
     if (seconds < 3600) return `${seconds / 60}-minute averages`;
     if (seconds === 3600) return "Hourly averages";
     if (seconds < 86400) return `${seconds / 3600}-hour averages`;

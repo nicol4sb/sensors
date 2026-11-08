@@ -10,13 +10,16 @@
 // ============================================================
 // VMC SENSOR - LOW POWER TEST
 //
-// SAME CODE FOR ALL 3 SENSORS.
+// SAME CODE FOR ALL 6 SENSORS.
 //
 // Change ONLY SENSOR_ID:
 //
-//   1 = Red
-//   2 = Green
-//   3 = Sensor 3
+//   1 = Parents
+//   2 = salon
+//   3 = outside
+//   4 = Sensor 4
+//   5 = Sensor 5
+//   6 = Sensor 6
 //
 // Every 10 minutes:
 //   wake
@@ -39,19 +42,18 @@
 //
 // CHANGE ONLY THIS VALUE FOR EACH SENSOR:
 //
-//   1 = Red
-//   2 = Green
-//   3 = Sensor 3
+//   1 = Parents
+//   2 = salon
+//   3 = outside
+//   4 = Sensor 4
+//   5 = Sensor 5
+//   6 = Sensor 6
 // ============================================================
 
-#define SENSOR_ID 2
-
-#if SENSOR_ID < 1 || SENSOR_ID > 3
-#error "SENSOR_ID must be 1, 2, or 3"
-#endif
+#define SENSOR_ID 3
 
 
-static const uint32_t MEASUREMENT_INTERVAL_MS = 600000UL;
+static const uint32_t MEASUREMENT_INTERVAL_MS = 6000UL;
 
 
 
