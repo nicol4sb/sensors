@@ -359,7 +359,7 @@ async function check() {
         await page.$$eval(".sensor-card", (cards) =>
           cards[3].getAttribute("aria-label"),
         ),
-        longName,
+        `${longName}, sensor 4`,
       );
     }
     await page.setViewport({

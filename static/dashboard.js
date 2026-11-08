@@ -105,12 +105,12 @@ function sensorCard(sensor) {
       : `${days} ${days === 1 ? "day" : "days"} since 100%`;
 
   // CSS selects the compact button or the full card as space allows.
-  return `<article class="sensor-card" aria-label="${name}" style="--sensor-color: ${escapeHtml(sensor.color)}">
+  return `<article class="sensor-card" aria-label="${name}, sensor ${escapeHtml(sensor.sensor_id)}" style="--sensor-color: ${escapeHtml(sensor.color)}">
       <button type="button" class="sensor-summary"
             data-sensor-id="${escapeHtml(sensor.sensor_id)}"
             aria-haspopup="dialog" aria-controls="sensor-details"
-            aria-label="${name}: ${formatNumber(sensor.temperature, 1)} °C, ${formatNumber(sensor.humidity, 1)}% humidity. Open full sensor details">
-        <span class="sensor-name">${name}</span>
+            aria-label="${name}, sensor ${escapeHtml(sensor.sensor_id)}: ${formatNumber(sensor.temperature, 1)} °C, ${formatNumber(sensor.humidity, 1)}% humidity. Open full sensor details">
+        <span class="sensor-label"><span class="sensor-name">${name}</span><span class="sensor-id">#${escapeHtml(sensor.sensor_id)}</span></span>
         <span class="tile-reading">${formatNumber(sensor.temperature, 1)}<span class="tile-unit"> °C</span></span>
         <span class="tile-reading tile-humidity">${formatNumber(sensor.humidity, 1)}<span class="tile-unit"> %</span></span>
       </button>
@@ -119,8 +119,9 @@ function sensorCard(sensor) {
           <div class="sensor-identity">
             <span class="sensor-dot" aria-hidden="true"></span>
             <span class="sensor-name">${name}</span>
+            <span class="sensor-id">#${escapeHtml(sensor.sensor_id)}</span>
           </div>
-          <span class="sequence">#${escapeHtml(sensor.sensor_id)} · SEQ ${escapeHtml(sensor.sequence ?? "Unknown")}</span>
+          <span class="sequence">SEQ ${escapeHtml(sensor.sequence ?? "Unknown")}</span>
         </div>
         <div class="main-values">
           <div>

@@ -20,7 +20,7 @@ for (let index = 0; index <= 90 * 144; index++) {
     else if (age <= 30 && index % 6 === 0) original.push({timestamp_ms, temperature: 20, humidity: 50, period_seconds: 3600, sample_count: 6});
     else if (age > 30 && index % 144 === 0) original.push({timestamp_ms, temperature: 20, humidity: 50, period_seconds: 86400, sample_count: 144});
 }
-const history = {1: {name: 'Red', points: original}, 2: {name: 'Green', points: original}};
+const history = {1: {name: 'salon', points: original}, 2: {name: 'Parents', points: original}};
 const before = JSON.stringify(history);
 const ninety = context.uniformHistory(history, 90 * 24, now);
 assert.equal(ninety.periodSeconds, 86400);

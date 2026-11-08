@@ -19,8 +19,8 @@ FIELDS = ['timestamp', 'sequence', 'temperature_c', 'humidity_percent', 'battery
 ZONE = ZoneInfo('Europe/Zurich')
 SENSORS = (
     # file, temperature baseline, humidity baseline, daily swing, season, battery life, last charge
-    ('red', 21.3, 47, 0.9, 2.6, 64, 12),
-    ('green', 20.1, 52, 1.2, 3.2, 83, 26),
+    ('sensor1', 21.3, 47, 0.9, 2.6, 64, 12),
+    ('sensor2', 20.1, 52, 1.2, 3.2, 83, 26),
     ('sensor3', 23.0, 44, 0.7, 2.2, 51, 41),
 )
 

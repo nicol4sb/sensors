@@ -420,14 +420,14 @@ function chartOptions(type, datasets) {
           drawTicks: true,
         },
         ticks: {
-          color: "#a5b3c5",
+          color: window.innerWidth > 700 ? "#d5e1ef" : "#a5b3c5",
           padding: 7,
           maxTicksLimit: window.innerWidth <= 700 ? 5 : 9,
           maxRotation: 0,
           autoSkip: false,
           font: {
-            size: 10,
-            weight: "500",
+            size: window.innerWidth > 700 ? 13 : 10,
+            weight: window.innerWidth > 700 ? "600" : "500",
           },
           callback: function (value, index, ticks) {
             if (!ticks[index].major) return "";

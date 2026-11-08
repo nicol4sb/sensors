@@ -55,7 +55,7 @@ SENSORS = {
 
         "color": "#ff5a5f",
 
-        "file": "red.csv",
+        "file": "sensor1.csv",
 
     },
 
@@ -65,7 +65,7 @@ SENSORS = {
 
         "color": "#35d07f",
 
-        "file": "green.csv",
+        "file": "sensor2.csv",
 
     },
 
