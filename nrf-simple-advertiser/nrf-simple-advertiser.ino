@@ -43,8 +43,8 @@
 // CHANGE ONLY THIS VALUE FOR EACH SENSOR:
 //
 //   1 = Parents
-//   2 = salon
-//   3 = outside
+//   2 = Salon
+//   3 = Outside
 //   4 = Sensor 4
 //   5 = Sensor 5
 //   6 = Sensor 6
@@ -53,7 +53,7 @@
 #define SENSOR_ID 3
 
 
-static const uint32_t MEASUREMENT_INTERVAL_MS = 6000UL;
+static const uint32_t MEASUREMENT_INTERVAL_MS = 600000UL;
 
 
 
