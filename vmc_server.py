@@ -71,7 +71,7 @@ SENSORS = {
 
     3: {
 
-        "name": "outside",
+        "name": "buanderie",
 
         "color": "#5da9ff",
 
@@ -81,7 +81,7 @@ SENSORS = {
 
     4: {
 
-        "name": "Sensor 4",
+        "name": "Outside",
 
         "color": "#f5b942",
 
@@ -2865,7 +2865,21 @@ html, body {
 
 
 
-let historyHours = 24;
+const HISTORY_RANGE_STORAGE_KEY = "vmc.historyHours";
+
+function readHistoryRange() {
+    try {
+        const saved = window.localStorage.getItem(HISTORY_RANGE_STORAGE_KEY);
+        if (saved === "all") return "all";
+        const hours = Number(saved);
+        if (Number.isFinite(hours) && hours > 0) return hours;
+    } catch {
+        // Keep the dashboard usable when browser storage is unavailable.
+    }
+    return 24;
+}
+
+let historyHours = readHistoryRange();
 
 
 
@@ -6174,6 +6188,11 @@ document.querySelector(".history-controls").addEventListener("click", event => {
     const button = event.target.closest("button[data-hours]");
     if (!button) return;
     historyHours = button.dataset.hours === "all" ? "all" : Number(button.dataset.hours);
+    try {
+        window.localStorage.setItem(HISTORY_RANGE_STORAGE_KEY, String(historyHours));
+    } catch {
+        // The range can still be changed when browser storage is unavailable.
+    }
     for (const other of document.querySelectorAll(".history-controls button")) {
         const selected = other === button;
         other.classList.toggle("active", selected);

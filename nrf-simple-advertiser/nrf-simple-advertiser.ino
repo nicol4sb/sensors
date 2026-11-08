@@ -8,20 +8,23 @@
 
 
 // ============================================================
-// VMC SENSOR - LOW POWER TEST
+// VMC SENSOR - USB-POWERED OUTSIDE / LOW-POWER INDOOR
 //
 // SAME CODE FOR ALL 6 SENSORS.
 //
 // Change ONLY SENSOR_ID:
 //
-//   1 = Parents
-//   2 = salon
-//   3 = outside
-//   4 = Sensor 4
+//   1 = salon
+//   2 = Parents
+//   3 = buanderie
+//   4 = Outside (USB power)
 //   5 = Sensor 5
 //   6 = Sensor 6
 //
-// Every 10 minutes:
+// Sensor 4: measure every minute and continuously repeat the
+// latest reading every 100 ms at maximum nRF52840 TX power.
+//
+// Other sensors, every 10 minutes:
 //   wake
 //   read SHT40
 //   read battery
@@ -33,7 +36,6 @@
 // No history
 // No BLE connection
 //
-// Production interval: 10 minutes.
 // ============================================================
 
 
@@ -42,18 +44,26 @@
 //
 // CHANGE ONLY THIS VALUE FOR EACH SENSOR:
 //
-//   1 = Parents
-//   2 = Salon
-//   3 = Outside
-//   4 = Sensor 4
+//   1 = salon
+//   2 = Parents
+//   3 = buanderie
+//   4 = Outside (USB power)
 //   5 = Sensor 5
 //   6 = Sensor 6
 // ============================================================
 
-#define SENSOR_ID 3
+#define SENSOR_ID 4
 
 
+#if SENSOR_ID == 4
+// Mains power: keep the latest sample available between measurements.
+static const uint32_t MEASUREMENT_INTERVAL_MS = 60000UL;
+static const uint16_t ADVERTISING_TIMEOUT_SECONDS = 0; // No timeout.
+#else
+// Battery power: a short advertising burst every ten minutes.
 static const uint32_t MEASUREMENT_INTERVAL_MS = 600000UL;
+static const uint16_t ADVERTISING_TIMEOUT_SECONDS = 2;
+#endif
 
 
 
@@ -265,8 +275,14 @@ void takeMeasurementAndAdvertise()
 
 
   // ----------------------------------------------------------
-  // Previous advertising burst has already timed out.
+  // Stop before modifying the payload used by the radio.
+  // Sensor 4 is still advertising the previous sample here.
   // ----------------------------------------------------------
+
+  if (Bluefruit.Advertising.isRunning())
+  {
+    Bluefruit.Advertising.stop();
+  }
 
   Bluefruit.Advertising.clearData();
 
@@ -287,8 +303,8 @@ void takeMeasurementAndAdvertise()
   //
   // 160 * 0.625 ms = 100 ms
   //
-  // About 20 advertising events during our 2-second
-  // diagnostic burst.
+  // Sensor 4 repeats continuously between one-minute samples.
+  // Battery sensors send about 20 events in a 2-second burst.
   // ----------------------------------------------------------
 
   Bluefruit.Advertising.setInterval(
@@ -298,14 +314,14 @@ void takeMeasurementAndAdvertise()
 
 
   // ----------------------------------------------------------
-  // Advertise for 2 seconds. The fast timeout is also configured
-  // as 2 seconds in setup so it cannot exceed this total timeout.
+  // A zero timeout keeps sensor 4 advertising until the next
+  // sample replaces the payload. Battery sensors stop after 2 s.
   //
   // Bluefruit/SoftDevice handles radio operation.
   // ----------------------------------------------------------
 
   Bluefruit.Advertising.start(
-      2
+      ADVERTISING_TIMEOUT_SECONDS
   );
 }
 
@@ -397,11 +413,11 @@ void setup()
   );
 
 
-  // Keep a two-second total timeout from inheriting Bluefruit's
-  // default 30-second fast-advertising phase.
+  // Match the fast phase to the total timeout. Zero keeps the
+  // USB-powered outside sensor advertising indefinitely.
 
   Bluefruit.Advertising.setFastTimeout(
-      2
+      ADVERTISING_TIMEOUT_SECONDS
   );
 
 
@@ -409,7 +425,7 @@ void setup()
   // ----------------------------------------------------------
   // TX power
   //
-  // +8 dBm for better reception margin.
+  // +8 dBm is the nRF52840 maximum; already used by all sensors.
   // ----------------------------------------------------------
 
   Bluefruit.setTxPower(
